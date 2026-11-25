@@ -453,6 +453,8 @@ export type YtDlpErrorCode =
   | "PROXY_ERROR"
   | "POT_UNAVAILABLE"
   | "FORMAT_UNAVAILABLE"
+  | "STREAM_STALLED"
+  | "CANCELLED"
   | "YTDLP_ERROR";
 
 export function classifyYtDlpError(
@@ -461,8 +463,19 @@ export function classifyYtDlpError(
 ): { code: YtDlpErrorCode; formattedMessage: string } {
   const msg = rawMessage.trim();
 
+  if (/\[CANCELLED\]|Stopped by user/i.test(msg)) {
+    return { code: "CANCELLED", formattedMessage: "[CANCELLED] Stopped by user." };
+  }
+
   if (/\[4K_UNAVAILABLE\]/i.test(msg)) {
     return { code: "4K_UNAVAILABLE", formattedMessage: msg };
+  }
+
+  if (/stalled|timed out/i.test(msg)) {
+    return {
+      code: "STREAM_STALLED",
+      formattedMessage: `[STREAM_STALLED] YouTube download stalled or timed out on this connection (${context?.quality ?? "auto"}). Try again, choose a lower quality, or configure a faster proxy in Settings. (${msg.slice(-200)})`,
+    };
   }
 
   if (/429|Too Many Requests/i.test(msg)) {

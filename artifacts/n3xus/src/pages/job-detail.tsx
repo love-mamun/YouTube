@@ -19,10 +19,11 @@ import { useState, useEffect, useRef } from "react";
 import {
   Play, CheckCircle2, Send, Loader2, ArrowLeft, Youtube,
   Facebook, AlertTriangle, Copy, Check, Eye, EyeOff,
-  ThumbsUp, Upload, ExternalLink, Settings as SettingsIcon,
+  ThumbsUp, Upload, ExternalLink, Settings as SettingsIcon, Square,
 } from "lucide-react";
 import { parseJobErrorDiagnostic } from "@/lib/ytdlp-errors";
 
+const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 const ACTIVE_STATUSES = ["pending", "downloading", "processing", "generating", "publishing"];
 
 function extractYouTubeId(url: string): string | null {
@@ -111,6 +112,21 @@ export default function JobDetail() {
     },
   });
   const selectThumb   = useSelectThumbnail({ mutation: { onSuccess: invalidate } });
+  const [cancelling, setCancelling] = useState(false);
+
+  const handleCancelJob = async () => {
+    if (!jobId || cancelling) return;
+    setCancelling(true);
+    try {
+      await fetch(`${BASE}/api/jobs/${jobId}/cancel`, {
+        method: "POST",
+        credentials: "include",
+      });
+      invalidate();
+    } finally {
+      setCancelling(false);
+    }
+  };
 
   useEffect(() => {
     if (!isDirty.current) return;
@@ -279,6 +295,17 @@ export default function JobDetail() {
                     Publish Now
                   </Button>
                 </div>
+              )}
+              {isActive && job.status !== "pending" && (
+                <Button
+                  variant="destructive"
+                  onClick={handleCancelJob}
+                  disabled={cancelling}
+                  className="gap-2 font-mono text-xs flex-1 sm:flex-none"
+                >
+                  {cancelling ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5 fill-current" />}
+                  {job.status === "publishing" ? "Stop / Reset" : "Stop Mission"}
+                </Button>
               )}
             </div>
           </div>

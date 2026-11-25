@@ -13,6 +13,7 @@ import {
   downloadVideoWithResilience,
   type YtDlpMeta,
 } from "./ytdlp-downloader";
+import { registerJobAbort, clearJobAbort } from "./job-registry";
 
 const execAsync = promisify(exec);
 
@@ -112,18 +113,20 @@ async function verifyFfmpeg(): Promise<boolean> {
 
 async function downloadVideo(
   url: string,
-  quality: string,
+  quality: string | null | undefined,
   outputPath: string,
   onProgress?: (pct: number) => void,
-  codec?: string | null
+  codec?: string | null,
+  signal?: AbortSignal
 ): Promise<void> {
   await downloadVideoWithResilience({
     url,
-    quality,
+    quality: quality ?? null,
     outputPath,
     onProgress,
     codec,
     jobTag: path.basename(outputPath, ".mp4"),
+    signal,
   });
 }
 
@@ -179,10 +182,14 @@ async function processWithFFmpegPipeline(
   quality: string,
   durationSecs: number | null,
   onProgress?: (pct: number) => void,
-  jobId?: number
+  jobId?: number,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = RESOLUTION_SETTINGS[quality] ?? RESOLUTION_SETTINGS["1080p"];
   const { scale, bitrate, w: outW } = res;
+  const is4k = quality === "4k";
+  const ffmpegPreset = is4k ? "veryfast" : "medium";
+  const threadArgs = is4k ? ["-threads", "2"] : [];
   const audioFilter = "atempo=1.02,asetrate=44982,aresample=44100";
   const progFile = jobId ? progressFilePath(jobId) : null;
 
@@ -237,10 +244,12 @@ async function processWithFFmpegPipeline(
       "-af", audioFilter,
       "-c:v", "libx264",
       "-b:v", bitrate,
-      "-preset", "medium",
+      "-preset", ffmpegPreset,
+      ...threadArgs,
       "-crf", "18",
       "-c:a", "aac",
       "-b:a", "192k",
+      "-movflags", "+faststart",
       ...(progFile ? ["-progress", progFile] : []),
       outputPath,
     ];
@@ -265,13 +274,19 @@ async function processWithFFmpegPipeline(
       "-af", audioFilter,
       "-c:v", "libx264",
       "-b:v", bitrate,
-      "-preset", "medium",
+      "-preset", ffmpegPreset,
+      ...threadArgs,
       "-crf", "18",
       "-c:a", "aac",
       "-b:a", "192k",
+      "-movflags", "+faststart",
       ...(progFile ? ["-progress", progFile] : []),
       outputPath,
     ];
+  }
+
+  if (signal?.aborted) {
+    throw new Error("[CANCELLED] Stopped by user");
   }
 
   return new Promise((resolve, reject) => {
@@ -292,6 +307,20 @@ async function processWithFFmpegPipeline(
     let stderrBuf = "";
     let lastReportedPct = -1;
     let pollInterval: ReturnType<typeof setInterval> | null = null;
+    let settled = false;
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      if (pollInterval) clearInterval(pollInterval);
+      try {
+        if (proc.pid) process.kill(-proc.pid, "SIGKILL");
+      } catch {
+        try { proc.kill("SIGKILL"); } catch { /* noop */ }
+      }
+      reject(new Error("[CANCELLED] Stopped by user"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     // Poll the -progress file every 3s for progress updates
     if (onProgress && durationSecs && durationSecs > 0 && progFile) {
@@ -313,15 +342,24 @@ async function processWithFFmpegPipeline(
 
     proc.on("close", (code) => {
       if (pollInterval) clearInterval(pollInterval);
+      signal?.removeEventListener("abort", onAbort);
       // Clean up helper files
       if (jobId) {
         try { if (existsSync(pidFilePath(jobId))) unlinkSync(pidFilePath(jobId)); } catch { /* noop */ }
         try { if (progFile && existsSync(progFile)) unlinkSync(progFile); } catch { /* noop */ }
       }
+      if (settled) return;
+      settled = true;
       if (code === 0) { resolve(); return; }
       reject(new Error(`FFmpeg processing failed (code ${code}): ${stderrBuf.slice(-600)}`));
     });
-    proc.on("error", reject);
+    proc.on("error", (err) => {
+      if (pollInterval) clearInterval(pollInterval);
+      signal?.removeEventListener("abort", onAbort);
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }
 
@@ -420,17 +458,26 @@ async function getWatermarkText(): Promise<string> {
 
 async function runPublishPipeline(jobId: number, platformsStr: string): Promise<void> {
   const platforms = platformsStr.split(",").map((p) => p.trim()).filter(Boolean);
+  const pubAbort = registerJobAbort(jobId);
 
   for (const platform of platforms) {
-    await db.insert(publishLogsTable).values({ jobId, platform, status: "pending" });
+    await db
+      .insert(publishLogsTable)
+      .values({ jobId, platform, status: "pending" })
+      .onConflictDoUpdate({
+        target: [publishLogsTable.jobId, publishLogsTable.platform],
+        set: { status: "pending", platformUrl: null, errorMessage: null },
+      })
+      .catch(() => db.insert(publishLogsTable).values({ jobId, platform, status: "pending" }));
   }
 
   await db.update(videoJobsTable)
-    .set({ status: "publishing", progress: 80 })
+    .set({ status: "publishing", progress: 80, errorMessage: null })
     .where(eq(videoJobsTable.id, jobId));
 
   try {
     for (const platform of platforms) {
+      if (pubAbort.signal.aborted) throw new Error("[CANCELLED] Stopped by user");
       if (platform === "youtube" || platform === "youtube-shorts") {
         const isShorts = platform === "youtube-shorts";
         const [ytToken] = await db
@@ -440,7 +487,7 @@ async function runPublishPipeline(jobId: number, platformsStr: string): Promise<
           .limit(1);
 
         if (ytToken) {
-          const result = await publishToYouTube(jobId, { isShorts });
+          const result = await publishToYouTube(jobId, { isShorts, signal: pubAbort.signal });
           await updatePublishLog(jobId, platform, "success", result.url);
         } else {
           await new Promise((r) => setTimeout(r, 2000));
@@ -456,6 +503,12 @@ async function runPublishPipeline(jobId: number, platformsStr: string): Promise<
           .where(and(eq(apiTokensTable.platform, "facebook"), eq(apiTokensTable.isActive, true)))
           .limit(1);
         if (fbToken) {
+          const [currentJob] = await db.select().from(videoJobsTable).where(eq(videoJobsTable.id, jobId)).limit(1);
+          const videoUrl = currentJob?.youtubeUrl?.trim() ?? "";
+          if (!currentJob?.videoPath || !existsSync(currentJob.videoPath)) {
+            if (!videoUrl) throw new Error("Cannot publish to Facebook: job has no source video URL.");
+            await downloadVideoForJob(idOrFallback(jobId), videoUrl, currentJob?.quality ?? "720p", pubAbort.signal);
+          }
           const result = await publishToFacebook(jobId);
           await updatePublishLog(jobId, platform, "success", result.url);
         } else {
@@ -482,8 +535,12 @@ async function runPublishPipeline(jobId: number, platformsStr: string): Promise<
     await db.update(videoJobsTable)
       .set({ status: "failed", errorMessage: msg })
       .where(eq(videoJobsTable.id, jobId));
+  } finally {
+    clearJobAbort(jobId, pubAbort);
   }
 }
+
+function idOrFallback(id: number): number { return id; }
 
 interface ProcessingOptions {
   /** Skip the download stage — use an already-downloaded raw file */
@@ -502,13 +559,31 @@ interface ProcessingOptions {
 export async function downloadVideoForJob(
   jobId: number,
   url: string,
-  quality = "720p"
+  quality = "720p",
+  signal?: AbortSignal
 ): Promise<string> {
   if (!existsSync(VIDEO_TMP_DIR)) mkdirSync(VIDEO_TMP_DIR, { recursive: true });
   const outputPath = `${VIDEO_TMP_DIR}/job-${jobId}-raw.mp4`;
   logger.info({ jobId, url, quality, outputPath }, "Downloading video for job (pre-publish)");
-  await downloadVideo(url, quality, outputPath);
-  await updateJob(jobId, { videoPath: outputPath });
+  let lastPct = 80;
+  let lastWriteAt = 0;
+  await downloadVideo(
+    url,
+    quality,
+    outputPath,
+    (pct) => {
+      const mapped = Math.min(89, 80 + Math.floor(pct * 0.09));
+      const now = Date.now();
+      if (mapped > lastPct && (now - lastWriteAt >= 1200 || mapped - lastPct >= 2)) {
+        lastPct = mapped;
+        lastWriteAt = now;
+        void updateJob(jobId, { progress: mapped }).catch(() => {});
+      }
+    },
+    null,
+    signal
+  );
+  await updateJob(jobId, { videoPath: outputPath, progress: 89 });
   logger.info({ jobId, outputPath }, "Pre-publish download complete");
   return outputPath;
 }
@@ -521,6 +596,8 @@ export async function startVideoProcessing(
   const { skipDownload = false, existingRawPath, skipToContentStage = false } = opts;
   logger.info({ jobId, videoUrl, skipDownload, skipToContentStage }, "Starting video processing pipeline");
 
+  const jobAbort = registerJobAbort(jobId);
+
   const [jobRow0] = await db.select().from(videoJobsTable).where(eq(videoJobsTable.id, jobId)).limit(1);
   const jobQuality = jobRow0?.quality ?? null;
   const jobCodec = jobRow0?.codec ?? null;
@@ -532,7 +609,7 @@ export async function startVideoProcessing(
 
   try {
     // ── Stage 1: Fetch metadata ──────────────────────────────────────────────
-    if (!skipToContentStage) await updateJob(jobId, { status: "downloading", progress: 5 });
+    if (!skipToContentStage) await updateJob(jobId, { status: "downloading", progress: 5, errorMessage: null });
 
     const platform = detectPlatform(videoUrl);
     logger.info({ jobId, platform, isDownloadJob, needsFFmpegPipeline }, "Detected source platform");
@@ -578,10 +655,25 @@ export async function startVideoProcessing(
         await updateJob(jobId, { status: "downloading", progress: 20 });
         logger.info({ jobId, quality: jobQuality }, "Starting full video download");
 
-        await downloadVideo(videoUrl, jobQuality!, rawPath, async (pct) => {
-          const progress = 20 + Math.floor(pct * 0.22);
-          await updateJob(jobId, { progress });
-        }, jobCodec);
+        let lastDlProgress = 20;
+        let lastDlWriteAt = 0;
+
+        await downloadVideo(
+          videoUrl,
+          jobQuality!,
+          rawPath,
+          (pct) => {
+            const progress = Math.min(42, 20 + Math.floor(pct * 0.22));
+            const now = Date.now();
+            if (progress > lastDlProgress && (now - lastDlWriteAt >= 1200 || progress - lastDlProgress >= 2)) {
+              lastDlProgress = progress;
+              lastDlWriteAt = now;
+              void updateJob(jobId, { progress }).catch(() => {});
+            }
+          },
+          jobCodec,
+          jobAbort.signal
+        );
 
         logger.info({ jobId }, "Download complete");
         await updateJob(jobId, { progress: 43 });
@@ -607,7 +699,8 @@ export async function startVideoProcessing(
             const progress = 45 + Math.floor(pct * 0.27);
             await updateJob(jobId, { progress });
           },
-          jobId
+          jobId,
+          jobAbort.signal
         );
 
         tryUnlink(rawPath);
@@ -675,27 +768,16 @@ export async function startVideoProcessing(
       status: "failed",
       errorMessage: err instanceof Error ? err.message : "Processing failed",
     });
+  } finally {
+    clearJobAbort(jobId, jobAbort);
   }
 }
 
-/**
- * On server startup: find jobs stuck in pending/downloading/processing and
- * resume them intelligently without re-doing already-finished stages.
- *
- * Resume logic per job:
- *   1. If a FFmpeg PID file exists and the process is still alive →
- *      re-attach progress monitoring and wait for it to finish, then
- *      continue the pipeline from Stage 4 onward.
- *   2. If processed output file already exists and is large enough →
- *      skip download + FFmpeg, continue from Stage 4 (content/thumbnails).
- *   3. If raw file exists → skip download, re-run FFmpeg from Stage 3.
- *   4. Otherwise → restart the full pipeline from scratch.
- */
 export async function resumeStuckJobs(): Promise<void> {
   const stuckJobs = await db
     .select()
     .from(videoJobsTable)
-    .where(inArray(videoJobsTable.status, ["pending", "downloading", "processing"]));
+    .where(inArray(videoJobsTable.status, ["pending", "downloading", "processing", "publishing"]));
 
   if (stuckJobs.length === 0) {
     logger.info("No stuck jobs to resume");
@@ -706,6 +788,17 @@ export async function resumeStuckJobs(): Promise<void> {
 
   for (const job of stuckJobs) {
     const jobId = job.id;
+
+    if (job.status === "publishing") {
+      logger.warn({ jobId }, "Job was interrupted mid-publish on restart — restoring to approved state");
+      await updateJob(jobId, {
+        status: "approved",
+        progress: 73,
+        errorMessage: "[PUBLISH_INTERRUPTED] Publishing was interrupted by a server restart. Click Publish Now to try again.",
+      });
+      continue;
+    }
+
     const videoUrl = job.youtubeUrl ?? "";
     if (!videoUrl) {
       logger.warn({ jobId }, "Stuck job has no URL — marking failed");

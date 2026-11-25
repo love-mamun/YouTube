@@ -16,6 +16,7 @@ import { startVideoProcessing } from "../lib/video-processor";
 import { publishToYouTube, updatePublishLog } from "../lib/youtube-publisher";
 import { publishToFacebook } from "../lib/facebook-publisher";
 import { downloadVideoForJob } from "../lib/video-processor";
+import { registerJobAbort, clearJobAbort, abortActiveJob } from "../lib/job-registry";
 import { existsSync } from "fs";
 
 const router: IRouter = Router();
@@ -129,7 +130,10 @@ router.get("/jobs/:id/status", async (req, res): Promise<void> => {
     generating: "Preparing content…",
     ready: "Content ready for review",
     approved: "Approved — ready to publish",
-    publishing: "Uploading to platforms…",
+    publishing:
+      job.progress != null && job.progress < 89
+        ? `Downloading source video for publish… ${Math.max(0, Math.round(((job.progress - 80) / 9) * 100))}%`
+        : `Uploading to platforms… ${Math.max(0, Math.round((((job.progress ?? 89) - 89) / 11) * 100))}%`,
     published: "Mission complete",
     failed: "Mission failed",
   };
@@ -206,6 +210,47 @@ router.post("/jobs/:id/approve", async (req, res): Promise<void> => {
   res.json(updated);
 });
 
+router.post("/jobs/:id/cancel", async (req, res): Promise<void> => {
+  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = parseInt(rawId, 10);
+  if (isNaN(id)) {
+    res.status(400).json({ error: "Invalid job ID" });
+    return;
+  }
+
+  const [job] = await db
+    .select()
+    .from(videoJobsTable)
+    .where(eq(videoJobsTable.id, id));
+
+  if (!job) {
+    res.status(404).json({ error: "Job not found" });
+    return;
+  }
+
+  abortActiveJob(id, "Stopped by user");
+
+  const nextState =
+    job.status === "publishing"
+      ? {
+          status: "approved",
+          progress: 73,
+          errorMessage: "[CANCELLED] Publishing stopped by user — click Publish Now to retry.",
+        }
+      : {
+          status: "failed",
+          errorMessage: "[CANCELLED] Mission stopped by user — click Retry Mission to run again.",
+        };
+
+  const [updated] = await db
+    .update(videoJobsTable)
+    .set(nextState)
+    .where(eq(videoJobsTable.id, id))
+    .returning();
+
+  res.json(updated);
+});
+
 router.post("/jobs/:id/publish", async (req, res): Promise<void> => {
   const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = parseInt(rawId, 10);
@@ -249,99 +294,137 @@ router.post("/jobs/:id/publish", async (req, res): Promise<void> => {
 
   const [updated] = await db
     .update(videoJobsTable)
-    .set({ status: "publishing", progress: 80 })
+    .set({ status: "publishing", progress: 80, errorMessage: null })
     .where(eq(videoJobsTable.id, id))
     .returning();
+
+  const pubAbort = registerJobAbort(id);
 
   (async () => {
     const succeeded = new Set<string>();
     let failedPlatform: string | null = null;
     let failMsg = "";
 
-    for (const platform of platforms) {
-      try {
-        if (platform === "youtube" || platform === "youtube-shorts") {
-          const isShorts = platform === "youtube-shorts";
-
-          const { apiTokensTable: tokTable } = await import("@workspace/db");
-          const [ytToken] = await db
-            .select()
-            .from(tokTable)
-            .where(and(eq(tokTable.platform, "youtube"), eq(tokTable.isActive, true)))
-            .limit(1);
-
-          if (ytToken) {
-            const rawCid = req.body?.channelId;
-            const parsedCid = rawCid != null ? parseInt(String(rawCid), 10) : null;
-            const channelId = parsedCid !== null && !isNaN(parsedCid) && parsedCid > 0 ? parsedCid : null;
-            req.log.info({ jobId: id, isShorts, channelId }, "Publishing to YouTube via OAuth");
-            const result = await publishToYouTube(id, { isShorts, channelId });
-            await updatePublishLog(id, platform, "success", result.url);
-          } else {
-            req.log.info({ jobId: id, isShorts }, "No YouTube token — using simulator");
-            await new Promise((r) => setTimeout(r, 3000));
-            const simUrl = isShorts
-              ? `https://youtube.com/shorts/sim-${id}-${Date.now()}`
-              : `https://youtube.com/watch?v=sim-${id}-${Date.now()}`;
-            await updatePublishLog(id, platform, "success", simUrl);
-          }
-        } else if (platform === "facebook") {
-          const { apiTokensTable: tokTable } = await import("@workspace/db");
-          const [fbToken] = await db
-            .select()
-            .from(tokTable)
-            .where(and(eq(tokTable.platform, "facebook"), eq(tokTable.isActive, true)))
-            .limit(1);
-
-          if (fbToken) {
-            // Auto-download the video at 720p if this was a metadata-only job
-            const [currentJob] = await db.select().from(videoJobsTable).where(eq(videoJobsTable.id, id));
-            const videoUrl = currentJob?.youtubeUrl?.trim() ?? "";
-            if (!videoUrl) throw new Error("Cannot publish to Facebook: job has no source video URL.");
-            if (!currentJob?.videoPath || !existsSync(currentJob.videoPath)) {
-              req.log.info({ jobId: id }, "No video file found — downloading at 720p before Facebook publish");
-              await downloadVideoForJob(id, videoUrl, "720p");
-            }
-            req.log.info({ jobId: id }, "Publishing to Facebook Page via Graph API");
-            const result = await publishToFacebook(id);
-            await updatePublishLog(id, platform, "success", result.url);
-          } else {
-            req.log.info({ jobId: id }, "No Facebook token — using simulator");
-            await new Promise((r) => setTimeout(r, 2500));
-            await updatePublishLog(id, platform, "success", `https://facebook.com/video/sim-${id}-${Date.now()}`);
-          }
-        } else {
-          await new Promise((r) => setTimeout(r, 2000));
-          await updatePublishLog(
-            id,
-            platform,
-            "success",
-            `https://${platform}.com/posts/sim-${id}`
-          );
+    try {
+      // If multi-platform includes Facebook + no-download, pre-download once into videoPath
+      // so both YouTube and Facebook share the same file without downloading twice.
+      if (platforms.includes("facebook") && platforms.length > 1) {
+        const [cur] = await db.select().from(videoJobsTable).where(eq(videoJobsTable.id, id));
+        const videoUrl = cur?.youtubeUrl?.trim() ?? "";
+        if (videoUrl && (!cur?.videoPath || !existsSync(cur.videoPath))) {
+          await downloadVideoForJob(id, videoUrl, cur?.quality ?? "720p", pubAbort.signal);
         }
-        succeeded.add(platform);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "Publish failed";
-        req.log.error({ err, jobId: id, platform }, "Publish pipeline error");
-        await updatePublishLog(id, platform, "failed", undefined, msg).catch(() => {});
-        if (!failedPlatform) { failedPlatform = platform; failMsg = msg; }
       }
-    }
 
-    if (failedPlatform) {
-      // At least one platform failed — mark job failed with the first error;
-      // successfully published platforms already have their logs preserved.
+      for (const platform of platforms) {
+        if (pubAbort.signal.aborted) {
+          throw new Error("[CANCELLED] Stopped by user");
+        }
+        try {
+          if (platform === "youtube" || platform === "youtube-shorts") {
+            const isShorts = platform === "youtube-shorts";
+
+            const { apiTokensTable: tokTable } = await import("@workspace/db");
+            const [ytToken] = await db
+              .select()
+              .from(tokTable)
+              .where(and(eq(tokTable.platform, "youtube"), eq(tokTable.isActive, true)))
+              .limit(1);
+
+            if (ytToken) {
+              const rawCid = req.body?.channelId;
+              const parsedCid = rawCid != null ? parseInt(String(rawCid), 10) : null;
+              const channelId = parsedCid !== null && !isNaN(parsedCid) && parsedCid > 0 ? parsedCid : null;
+              req.log.info({ jobId: id, isShorts, channelId }, "Publishing to YouTube via OAuth");
+              const result = await publishToYouTube(id, { isShorts, channelId, signal: pubAbort.signal });
+              await updatePublishLog(id, platform, "success", result.url);
+            } else {
+              req.log.info({ jobId: id, isShorts }, "No YouTube token — using simulator");
+              await new Promise((r) => setTimeout(r, 3000));
+              const simUrl = isShorts
+                ? `https://youtube.com/shorts/sim-${id}-${Date.now()}`
+                : `https://youtube.com/watch?v=sim-${id}-${Date.now()}`;
+              await updatePublishLog(id, platform, "success", simUrl);
+            }
+          } else if (platform === "facebook") {
+            const { apiTokensTable: tokTable } = await import("@workspace/db");
+            const [fbToken] = await db
+              .select()
+              .from(tokTable)
+              .where(and(eq(tokTable.platform, "facebook"), eq(tokTable.isActive, true)))
+              .limit(1);
+
+            if (fbToken) {
+              // Auto-download the video at 720p if this was a metadata-only job
+              const [currentJob] = await db.select().from(videoJobsTable).where(eq(videoJobsTable.id, id));
+              const videoUrl = currentJob?.youtubeUrl?.trim() ?? "";
+              if (!videoUrl) throw new Error("Cannot publish to Facebook: job has no source video URL.");
+              if (!currentJob?.videoPath || !existsSync(currentJob.videoPath)) {
+                req.log.info({ jobId: id }, "No video file found — downloading before Facebook publish");
+                await downloadVideoForJob(id, videoUrl, currentJob?.quality ?? "720p", pubAbort.signal);
+              }
+              req.log.info({ jobId: id }, "Publishing to Facebook Page via Graph API");
+              const result = await publishToFacebook(id);
+              await updatePublishLog(id, platform, "success", result.url);
+            } else {
+              req.log.info({ jobId: id }, "No Facebook token — using simulator");
+              await new Promise((r) => setTimeout(r, 2500));
+              await updatePublishLog(id, platform, "success", `https://facebook.com/video/sim-${id}-${Date.now()}`);
+            }
+          } else {
+            await new Promise((r) => setTimeout(r, 2000));
+            await updatePublishLog(
+              id,
+              platform,
+              "success",
+              `https://${platform}.com/posts/sim-${id}`
+            );
+          }
+          succeeded.add(platform);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Publish failed";
+          req.log.error({ err, jobId: id, platform }, "Publish pipeline error");
+          await updatePublishLog(id, platform, "failed", undefined, msg).catch(() => {});
+          if (!failedPlatform) { failedPlatform = platform; failMsg = msg; }
+        }
+      }
+
+      if (pubAbort.signal.aborted) {
+        return;
+      }
+
+      if (failedPlatform) {
+        await db
+          .update(videoJobsTable)
+          .set({ status: "failed", errorMessage: failMsg })
+          .where(eq(videoJobsTable.id, id));
+      } else {
+        await db
+          .update(videoJobsTable)
+          .set({ status: "published", progress: 100, errorMessage: null })
+          .where(eq(videoJobsTable.id, id));
+      }
+    } catch (outerErr) {
+      if (pubAbort.signal.aborted) return;
+      const msg = outerErr instanceof Error ? outerErr.message : "Publish failed";
+      req.log.error({ err: outerErr, jobId: id }, "Unexpected publish failure");
       await db
         .update(videoJobsTable)
-        .set({ status: "failed", errorMessage: failMsg })
-        .where(eq(videoJobsTable.id, id));
-    } else {
-      await db
-        .update(videoJobsTable)
-        .set({ status: "published", progress: 100 })
-        .where(eq(videoJobsTable.id, id));
+        .set({ status: "failed", errorMessage: msg })
+        .where(eq(videoJobsTable.id, id))
+        .catch(() => {});
+    } finally {
+      clearJobAbort(id, pubAbort);
     }
-  })();
+  })().catch(async (err) => {
+    clearJobAbort(id, pubAbort);
+    req.log.error({ err, jobId: id }, "Fatal publish runner error");
+    await db
+      .update(videoJobsTable)
+      .set({ status: "failed", errorMessage: err instanceof Error ? err.message : "Publish failed" })
+      .where(eq(videoJobsTable.id, id))
+      .catch(() => {});
+  });
 
   res.json(updated);
 });

@@ -153,6 +153,8 @@ export function parseJobErrorDiagnostic(errorMessage: string): ParsedJobDiagnost
       ? "4K_UNAVAILABLE"
       : /proxy/i.test(msg)
       ? "PROXY_ERROR"
+      : /stalled|timed out/i.test(msg)
+      ? "STREAM_STALLED"
       : "YTDLP_ERROR");
 
   switch (code) {
@@ -224,6 +226,52 @@ export function parseJobErrorDiagnostic(errorMessage: string): ParsedJobDiagnost
           "Open Settings and run 'Test Download Setup' to verify PO Token Server status.",
         ],
         showSettingsLink: true,
+      };
+    case "STREAM_STALLED":
+      return {
+        code,
+        title: "Download Stalled / Timed Out",
+        summary: cleanMsg,
+        tips: [
+          "YouTube's media stream stopped transferring data or timed out on the server connection.",
+          "Click Retry Mission (or Publish Now if the error happened during No-Download publish).",
+          "For 4K missions, ensure a stable proxy or fresh Netscape cookies in Settings if Render's IP is throttled.",
+        ],
+        showSettingsLink: true,
+      };
+    case "UPLOAD_TIMEOUT":
+      return {
+        code,
+        title: "Platform Upload Stalled",
+        summary: cleanMsg,
+        tips: [
+          "Uploading the video stream to YouTube/Facebook stalled with no progress for 2 minutes.",
+          "Click Publish Now to retry the upload cleanly without re-creating the mission.",
+          "Check Settings to verify your target YouTube/Facebook channel token is still valid.",
+        ],
+        showSettingsLink: true,
+      };
+    case "PUBLISH_INTERRUPTED":
+      return {
+        code,
+        title: "Publishing Interrupted by Restart",
+        summary: cleanMsg,
+        tips: [
+          "The server restarted while this mission was preparing or uploading the video.",
+          "Your approved metadata and edits are preserved — click Publish Now to resume.",
+        ],
+        showSettingsLink: false,
+      };
+    case "CANCELLED":
+      return {
+        code,
+        title: "Mission Stopped",
+        summary: cleanMsg,
+        tips: [
+          "Execution was cancelled by user request and active transfers were stopped.",
+          "Use Retry Mission or Publish Now whenever you are ready to run it again.",
+        ],
+        showSettingsLink: false,
       };
     default:
       return {

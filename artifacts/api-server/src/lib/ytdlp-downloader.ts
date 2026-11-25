@@ -1,6 +1,7 @@
 import { spawn, execFile } from "child_process";
 import { promisify } from "util";
-import { existsSync, unlinkSync } from "fs";
+import { existsSync, unlinkSync, statSync, readdirSync } from "fs";
+import * as path from "path";
 import * as net from "net";
 import { logger } from "./logger";
 import {
@@ -52,8 +53,19 @@ const VCODEC_MAP: Record<string, string> = {
   h264: "avc1",
 };
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new Error("Stopped by user"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Stopped by user"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function buildStrategies(hasCookies: boolean, hasPot: boolean): ClientStrategy[] {
@@ -73,10 +85,11 @@ function buildStrategies(hasCookies: boolean, hasPot: boolean): ClientStrategy[]
     ];
   }
   if (!hasPot && hasCookies) {
+    // Without PO token server, android_vr & tv_embedded avoid web SABR stalls
     return [
       { client: "tv_embedded", useCookies: true, usePot: false, useMissingPotFlag: true },
-      { client: "web", useCookies: true, usePot: false, useMissingPotFlag: true },
       { client: "android_vr", useCookies: false, usePot: false, useMissingPotFlag: true },
+      { client: "web", useCookies: true, usePot: false, useMissingPotFlag: true },
     ];
   }
   return [
@@ -85,38 +98,133 @@ function buildStrategies(hasCookies: boolean, hasPot: boolean): ClientStrategy[]
   ];
 }
 
+function getPrefixFileBytes(targetOutputPath: string): number {
+  try {
+    const dir = path.dirname(targetOutputPath);
+    const base = path.basename(targetOutputPath, ".mp4");
+    const entries = readdirSync(dir);
+    let total = 0;
+    for (const name of entries) {
+      if (name.startsWith(base)) {
+        try {
+          total += statSync(path.join(dir, name)).size;
+        } catch {
+          // noop
+        }
+      }
+    }
+    return total;
+  } catch {
+    return 0;
+  }
+}
+
+interface SpawnYtDlpOptions {
+  onProgress?: (pct: number) => void;
+  timeoutMs?: number;
+  stallTimeoutMs?: number;
+  watchOutputPath?: string;
+  signal?: AbortSignal;
+}
+
 function spawnYtDlpRaw(
   args: string[],
-  onProgress?: (pct: number) => void,
-  timeoutMs = 240_000
+  opts: SpawnYtDlpOptions = {}
 ): Promise<{ stdout: string; stderr: string }> {
+  const {
+    onProgress,
+    timeoutMs = 600_000,
+    stallTimeoutMs = 90_000,
+    watchOutputPath,
+    signal,
+  } = opts;
+
+  if (signal?.aborted) {
+    return Promise.reject(new Error("Stopped by user"));
+  }
+
   return new Promise((resolve, reject) => {
     let stdout = "";
     let stderr = "";
-    let timedOut = false;
+    let settled = false;
+    let lastActivityAt = Date.now();
+    let lastWatchedBytes = watchOutputPath ? getPrefixFileBytes(watchOutputPath) : 0;
 
-    const proc = spawn("python3", ["-m", "yt_dlp", ...args], { env: YTDLP_ENV });
+    const proc = spawn("python3", ["-m", "yt_dlp", ...args], {
+      env: { ...YTDLP_ENV, PYTHONUNBUFFERED: "1" },
+    });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      proc.kill("SIGKILL");
-      reject(new Error("yt-dlp timed out"));
+    const cleanupTimers = () => {
+      clearTimeout(totalTimer);
+      clearInterval(stallWatch);
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    const failWith = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanupTimers();
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // noop
+      }
+      reject(err);
+    };
+
+    const onAbort = () => {
+      failWith(new Error("Stopped by user"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    const totalTimer = setTimeout(() => {
+      failWith(new Error(`yt-dlp timed out after ${Math.round(timeoutMs / 1000)}s`));
     }, timeoutMs);
 
+    const stallWatch = setInterval(() => {
+      if (watchOutputPath) {
+        const curBytes = getPrefixFileBytes(watchOutputPath);
+        if (curBytes > lastWatchedBytes) {
+          lastWatchedBytes = curBytes;
+          lastActivityAt = Date.now();
+        }
+      }
+      if (Date.now() - lastActivityAt >= stallTimeoutMs) {
+        failWith(
+          new Error(
+            `yt-dlp stalled (no download progress for ${Math.round(stallTimeoutMs / 1000)}s): ${stderr.slice(-300)}`
+          )
+        );
+      }
+    }, 5_000);
+
     proc.stdout.on("data", (chunk: Buffer) => {
-      const line = chunk.toString();
-      stdout += line;
-      const m = line.match(/(\d+\.\d+)%/);
-      if (m && onProgress) onProgress(parseFloat(m[1]));
+      lastActivityAt = Date.now();
+      const text = chunk.toString();
+      stdout += text;
+      if (onProgress) {
+        const lines = text.split(/[\r\n]+/);
+        for (const line of lines) {
+          const m = line.match(/(\d+(?:\.\d+)?)%/);
+          if (m) {
+            const pct = parseFloat(m[1]);
+            if (!Number.isNaN(pct) && pct >= 0 && pct <= 100) {
+              onProgress(pct);
+            }
+          }
+        }
+      }
     });
 
     proc.stderr.on("data", (chunk: Buffer) => {
+      lastActivityAt = Date.now();
       stderr += chunk.toString();
     });
 
     proc.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) return;
+      if (settled) return;
+      settled = true;
+      cleanupTimers();
       if (code === 0) {
         resolve({ stdout, stderr });
         return;
@@ -125,7 +233,9 @@ function spawnYtDlpRaw(
     });
 
     proc.on("error", (err) => {
-      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      cleanupTimers();
       reject(err);
     });
   });
@@ -162,8 +272,9 @@ export async function fetchYtDlpMetadataShared(url: string): Promise<YtDlpMeta> 
       "--no-playlist",
       "--skip-download",
       "--ignore-no-formats-error",
-      "--sleep-requests", "1",
-      "--retries", "2",
+      "--force-ipv4",
+      "--socket-timeout", "15",
+      "--retries", "1",
       ...JS_RUNTIME_ARGS,
       ...(chosen.usePot ? pot.extractorArgs : []),
       "--extractor-args", extractorVal,
@@ -172,7 +283,7 @@ export async function fetchYtDlpMetadataShared(url: string): Promise<YtDlpMeta> 
       url,
     ];
 
-    const { stdout } = await spawnYtDlpRaw(args, undefined, 45_000);
+    const { stdout } = await spawnYtDlpRaw(args, { timeoutMs: 35_000, stallTimeoutMs: 30_000 });
     const raw = stdout.trim();
     if (raw) {
       return JSON.parse(raw) as YtDlpMeta;
@@ -194,8 +305,9 @@ export async function downloadVideoWithResilience(options: {
   onProgress?: (pct: number) => void;
   codec?: string | null;
   jobTag?: string;
+  signal?: AbortSignal;
 }): Promise<void> {
-  const { url, quality, outputPath, onProgress, codec, jobTag = "dl" } = options;
+  const { url, quality, outputPath, onProgress, codec, jobTag = "dl", signal } = options;
   const isStrict4K = quality?.toLowerCase() === "4k";
   const maxH = quality ? (HEIGHT_MAP[quality.toLowerCase()] ?? 1080) : 1080;
   const vcodecFilter = codec && VCODEC_MAP[codec] ? `[vcodec^=${VCODEC_MAP[codec]}]` : "";
@@ -222,10 +334,14 @@ export async function downloadVideoWithResilience(options: {
       );
     }
     formatSelectors.push(
-      `bestvideo*[height<=${maxH}]+bestaudio/bestvideo*+bestaudio/b`
+      `bestvideo*[height<=${maxH}]+bestaudio/bestvideo*[height<=1080]+bestaudio/b`
     );
   } else {
-    formatSelectors.push("bestvideo*+bestaudio/b");
+    // Metadata-only ("No Download") fallback download at publish time:
+    // Cap to 1080p MP4-compatible streams so publishing doesn't pull massive 4K/8K files unexpectedly.
+    formatSelectors.push(
+      "bestvideo*[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo*[height<=1080]+bestaudio/b[height<=1080]/b"
+    );
   }
 
   const uniqueFormats = Array.from(new Set(formatSelectors));
@@ -238,10 +354,12 @@ export async function downloadVideoWithResilience(options: {
     "--merge-output-format", "mp4",
     "--no-playlist",
     "--no-check-formats",
+    "--newline",
     "--progress",
-    "--sleep-requests", "1.5",
-    "--sleep-interval", "2",
-    "--max-sleep-interval", "5",
+    "--force-ipv4",
+    "--socket-timeout", "20",
+    "--concurrent-fragments", "4",
+    "--sleep-requests", "1",
     "--retries", "2",
     "--extractor-retries", "2",
     ...JS_RUNTIME_ARGS,
@@ -253,20 +371,32 @@ export async function downloadVideoWithResilience(options: {
   let rateLimitHits = 0;
   let botCheckHit = false;
   let formatMiss4KHit = false;
+  let stallHits = 0;
+
+  const perAttemptTotalMs = isStrict4K ? 720_000 : 360_000;
+  const perAttemptStallMs = isStrict4K ? 95_000 : 75_000;
 
   try {
     for (let sIdx = 0; sIdx < strategies.length; sIdx++) {
+      if (signal?.aborted) {
+        throw new Error("[CANCELLED] Stopped by user");
+      }
+
       const strat = strategies[sIdx];
       const extractorVal = strat.useMissingPotFlag
         ? `youtube:player_client=${strat.client};formats=missing_pot`
         : `youtube:player_client=${strat.client}`;
 
       for (const fmt of uniqueFormats) {
+        if (signal?.aborted) {
+          throw new Error("[CANCELLED] Stopped by user");
+        }
+
         logger.info(
           {
             url,
             client: strat.client,
-            quality: quality ?? "auto",
+            quality: quality ?? "auto-1080p",
             isStrict4K,
             hasCookies: strat.useCookies && cookieCopy.hasCookies,
             potMode: strat.usePot ? pot.mode : "none",
@@ -291,8 +421,13 @@ export async function downloadVideoWithResilience(options: {
               ...commonArgs,
               url,
             ],
-            onProgress,
-            240_000
+            {
+              onProgress,
+              timeoutMs: perAttemptTotalMs,
+              stallTimeoutMs: perAttemptStallMs,
+              watchOutputPath: outputPath,
+              signal,
+            }
           );
 
           // Strict 4K verification via ffprobe
@@ -306,10 +441,14 @@ export async function downloadVideoWithResilience(options: {
             }
           }
 
-          logger.info({ url, client: strat.client, quality: quality ?? "auto" }, "Download succeeded");
+          logger.info({ url, client: strat.client, quality: quality ?? "auto-1080p" }, "Download succeeded");
           return;
         } catch (err) {
           lastError = err instanceof Error ? err.message : String(err);
+          if (signal?.aborted || /Stopped by user|\[CANCELLED\]/i.test(lastError)) {
+            throw new Error("[CANCELLED] Stopped by user");
+          }
+
           logger.warn(
             { url, client: strat.client, err: lastError.slice(0, 180) },
             "yt-dlp strategy failed"
@@ -348,17 +487,19 @@ export async function downloadVideoWithResilience(options: {
             formatMiss4KHit = true;
           }
 
-          // Paced backoff before trying another format/client to reduce 429 burst pressure
-          await sleep(2200);
+          if (/stalled/i.test(lastError)) {
+            stallHits++;
+          }
+
+          await sleep(1200, signal);
         }
       }
 
       if (sIdx < strategies.length - 1) {
-        await sleep(2500);
+        await sleep(1500, signal);
       }
     }
 
-    // Choose the most informative root error if strategies exhausted
     const prioritizedError =
       rateLimitHits > 0 && !/429|Too Many Requests/i.test(lastError)
         ? `HTTP Error 429: Too Many Requests (${lastError})`
@@ -366,6 +507,8 @@ export async function downloadVideoWithResilience(options: {
         ? `Sign in to confirm you're not a bot (${lastError})`
         : formatMiss4KHit && isStrict4K && !/4K_UNAVAILABLE/i.test(lastError)
         ? `Requested format is not available for 2160p (${lastError})`
+        : stallHits > 0 && !/stalled/i.test(lastError)
+        ? `Download stalled waiting on YouTube stream (${lastError})`
         : lastError;
 
     const classified = classifyYtDlpError(prioritizedError, {
@@ -400,27 +543,22 @@ export async function runYtDlpDiagnostics(opts: {
   proxyOverride?: string | null;
   runLiveProbe?: boolean;
 }): Promise<DiagnosticsReport> {
-  // 1. Check yt-dlp availability
   let ytDlpVersion: string | null = null;
   let ytDlpErr: string | null = null;
   try {
-    const { stdout } = await spawnYtDlpRaw(["--version"], undefined, 10_000);
+    const { stdout } = await spawnYtDlpRaw(["--version"], { timeoutMs: 10_000, stallTimeoutMs: 10_000 });
     ytDlpVersion = stdout.trim();
   } catch (err) {
     ytDlpErr = err instanceof Error ? err.message : "yt-dlp not found";
   }
 
-  // 2. Check PO Token server
   const pot = await detectPotProvider();
 
-  // 3. Determine proxy (override or stored)
   const effectiveProxy = opts.proxyOverride !== undefined ? opts.proxyOverride : await getStoredProxyUrl();
   let proxyOk: boolean | null = null;
   let proxyErr: string | null = null;
 
   if (effectiveProxy && ytDlpVersion) {
-    // Quick curl / HTTP connectivity check through proxy isn't guaranteed if curl missing;
-    // use yt-dlp live probe or node tcp check to proxy host:port
     try {
       const parsed = new URL(effectiveProxy);
       const port = Number(parsed.port);
@@ -470,7 +608,6 @@ export async function runYtDlpDiagnostics(opts: {
     return report;
   }
 
-  // 4. Safe live yt-dlp simulate probe on validated YouTube URL
   const targetUrl = opts.testUrl || "https://www.youtube.com/watch?v=jNQXAC9IVRw";
   report.probe.attempted = true;
 
@@ -490,7 +627,8 @@ export async function runYtDlpDiagnostics(opts: {
         "--simulate",
         "--no-playlist",
         "--skip-download",
-        "--sleep-requests", "1",
+        "--force-ipv4",
+        "--socket-timeout", "15",
         ...JS_RUNTIME_ARGS,
         ...(chosen.usePot ? pot.extractorArgs : []),
         "--extractor-args", extractorVal,
@@ -498,8 +636,7 @@ export async function runYtDlpDiagnostics(opts: {
         ...(effectiveProxy ? ["--proxy", effectiveProxy] : []),
         targetUrl,
       ],
-      undefined,
-      30_000
+      { timeoutMs: 30_000, stallTimeoutMs: 25_000 }
     );
 
     const parsed = JSON.parse(stdout) as { formats?: Array<{ height?: number; vcodec?: string }> };

@@ -4,12 +4,15 @@ import { db, apiTokensTable, publishLogsTable, videoJobsTable, thumbnailsTable, 
 import { logger } from "./logger";
 import { downloadVideoWithResilience } from "./ytdlp-downloader";
 import { getConfig } from "./app-config";
-import { spawn } from "child_process";
-import { existsSync } from "fs";
+import { spawn, execFile } from "child_process";
+import { promisify } from "util";
+import { existsSync, statSync, createReadStream } from "fs";
 import { unlink } from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { Readable } from "stream";
+
+const execFileAsync = promisify(execFile);
 /** Crop a horizontal video to 9:16 vertical for YouTube Shorts (1080×1920). */
 function createShortsVersionLocal(inputPath: string, outputPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -189,17 +192,48 @@ async function getYouTubeClient(channelId?: number | null) {
   return google.youtube({ version: "v3", auth: oauth2Client });
 }
 
-async function downloadVideoWithYtDlp(videoUrl: string, quality?: string | null): Promise<string> {
+async function updateJobProgressThrottled(
+  jobId: number,
+  progress: number,
+  state: { lastPct: number; lastAt: number }
+) {
+  const clamped = Math.max(0, Math.min(99, Math.round(progress)));
+  const now = Date.now();
+  if (clamped <= state.lastPct && now - state.lastAt < 4000) return;
+  if (clamped === state.lastPct) return;
+  if (now - state.lastAt < 1200 && clamped - state.lastPct < 3) return;
+  state.lastPct = clamped;
+  state.lastAt = now;
+  await db
+    .update(videoJobsTable)
+    .set({ progress: clamped })
+    .where(eq(videoJobsTable.id, jobId))
+    .catch(() => {});
+}
+
+async function downloadVideoWithYtDlp(
+  videoUrl: string,
+  quality?: string | null,
+  opts?: { jobId?: number; signal?: AbortSignal }
+): Promise<string> {
   const tmpDir = os.tmpdir();
   const outputPath = path.join(tmpDir, `n3xus_${Date.now()}.mp4`);
+  const progressState = { lastPct: 80, lastAt: 0 };
 
-  logger.info({ videoUrl, quality }, "Downloading video via shared resilient yt-dlp pipeline for publish");
+  logger.info({ jobId: opts?.jobId, videoUrl, quality }, "Downloading video via shared resilient yt-dlp pipeline for publish");
 
   await downloadVideoWithResilience({
     url: videoUrl,
     quality: quality ?? null,
     outputPath,
-    jobTag: "pub",
+    jobTag: opts?.jobId ? `pub-${opts.jobId}` : "pub",
+    signal: opts?.signal,
+    onProgress: opts?.jobId
+      ? (pct) => {
+          const mapped = 80 + (pct / 100) * 9; // 80 -> 89%
+          void updateJobProgressThrottled(opts.jobId!, mapped, progressState);
+        }
+      : undefined,
   });
 
   if (existsSync(outputPath)) return outputPath;
@@ -210,6 +244,7 @@ async function downloadVideoWithYtDlp(videoUrl: string, quality?: string | null)
 export interface PublishYouTubeOptions {
   isShorts?: boolean;
   channelId?: number | null;
+  signal?: AbortSignal;
 }
 
 export async function publishToYouTube(
@@ -241,16 +276,24 @@ export async function publishToYouTube(
       if (job.videoPath) {
         logger.warn({ jobId, videoPath: job.videoPath }, "Stored video file missing — falling back to re-download");
       }
-      localPath = await downloadVideoWithYtDlp(job.youtubeUrl, job.quality);
+      localPath = await downloadVideoWithYtDlp(job.youtubeUrl, job.quality, {
+        jobId,
+        signal: options.signal,
+      });
+    }
+    if (!localPath) {
+      throw new Error("Video file path missing before YouTube upload");
     }
     // ── Shorts: auto-crop horizontal video to 9:16 vertical ─────────────────
     // If the file is wider than tall (e.g. 16:9 from a 4K mission), FFmpeg crops
     // the center to portrait format so YouTube Shorts plays correctly.
     if (options.isShorts && localPath) {
       try {
-        const { stdout: probeOut } = await spawnAsync("ffprobe", [
-          "-v", "quiet", "-print_format", "json", "-show_streams", localPath,
-        ], 15_000).catch(() => ({ stdout: "{}", stderr: "" }));
+        const { stdout: probeOut } = await execFileAsync(
+          "ffprobe",
+          ["-v", "quiet", "-print_format", "json", "-show_streams", localPath],
+          { timeout: 15_000 }
+        ).catch(() => ({ stdout: "{}", stderr: "" }));
         const probeData = JSON.parse(probeOut) as { streams?: Array<{ codec_type: string; width?: number; height?: number }> };
         const vStream = probeData.streams?.find((s) => s.codec_type === "video");
         const vidW = Number(vStream?.width ?? 0);
@@ -272,7 +315,7 @@ export async function publishToYouTube(
 
     const tagsArr = (job.tags ?? "")
       .split(",")
-      .map((t) => t.trim())
+      .map((t: string) => t.trim())
       .filter(Boolean)
       .slice(0, 30);
 
@@ -312,28 +355,74 @@ export async function publishToYouTube(
       tagsArr.push("Shorts");
     }
 
-    const { createReadStream } = await import("fs");
+    const totalBytes = Math.max(1, statSync(localPath).size);
+    let uploadedBytes = 0;
+    const uploadProgState = { lastPct: 90, lastAt: 0 };
+    await updateJobProgressThrottled(jobId, 90, { lastPct: 0, lastAt: 0 });
 
-    const response = await yt.videos.insert({
-      part: ["snippet", "status"],
-      requestBody: {
-        snippet: {
-          title,
-          description: fullDescription,
-          tags: tagsArr,
-          categoryId: "22",
-          defaultLanguage: "en",
-        },
-        status: {
-          privacyStatus: "public",
-          selfDeclaredMadeForKids: false,
-        },
-      },
-      media: {
-        mimeType: "video/mp4",
-        body: createReadStream(localPath),
-      },
+    const uploadAbort = new AbortController();
+    let lastByteAt = Date.now();
+    let stalledOut = false;
+
+    const onParentAbort = () => uploadAbort.abort(new Error("Stopped by user"));
+    if (options.signal?.aborted) {
+      throw new Error("[CANCELLED] Stopped by user");
+    }
+    options.signal?.addEventListener("abort", onParentAbort, { once: true });
+
+    const uploadWatchdog = setInterval(() => {
+      if (Date.now() - lastByteAt >= 120_000) {
+        stalledOut = true;
+        uploadAbort.abort(new Error("YouTube upload stalled with no bytes sent for 120s"));
+      }
+    }, 5_000);
+
+    const mediaStream = createReadStream(localPath);
+    mediaStream.on("data", (chunk: Buffer | string) => {
+      lastByteAt = Date.now();
+      uploadedBytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
+      const pct = Math.min(100, (uploadedBytes / totalBytes) * 100);
+      void updateJobProgressThrottled(jobId, 90 + (pct / 100) * 9, uploadProgState);
     });
+
+    let response;
+    try {
+      response = await yt.videos.insert(
+        {
+          part: ["snippet", "status"],
+          requestBody: {
+            snippet: {
+              title,
+              description: fullDescription,
+              tags: tagsArr,
+              categoryId: "22",
+              defaultLanguage: "en",
+            },
+            status: {
+              privacyStatus: "public",
+              selfDeclaredMadeForKids: false,
+            },
+          },
+          media: {
+            mimeType: "video/mp4",
+            body: mediaStream,
+          },
+        },
+        { signal: uploadAbort.signal }
+      );
+    } catch (uploadErr) {
+      mediaStream.destroy();
+      if (options.signal?.aborted) {
+        throw new Error("[CANCELLED] Stopped by user");
+      }
+      if (stalledOut) {
+        throw new Error("[UPLOAD_TIMEOUT] YouTube upload stalled (no progress for 2 minutes). Click Publish Now to retry.");
+      }
+      throw uploadErr;
+    } finally {
+      clearInterval(uploadWatchdog);
+      options.signal?.removeEventListener("abort", onParentAbort);
+    }
 
     const videoId = response.data.id!;
     const videoUrl = options.isShorts

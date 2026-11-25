@@ -75,8 +75,18 @@ const STAGE_CONFIG: Record<string, {
 };
 
 function StageProgressPanel({ status, progress }: { status: string; progress: number }) {
-  const cfg = STAGE_CONFIG[status];
-  if (!cfg) return null;
+  const baseCfg = STAGE_CONFIG[status];
+  if (!baseCfg) return null;
+
+  const isPreparingPublish = status === "publishing" && progress < 89;
+  const cfg = isPreparingPublish
+    ? {
+        ...baseCfg,
+        icon: <Download className="w-3.5 h-3.5" />,
+        label: "PREPARING VIDEO FOR UPLOAD",
+        sublabel: "Downloading source video before platform upload",
+      }
+    : baseCfg;
 
   const subPct = computeSubProgress(status, progress);
   const isIndeterminate = status === "generating" && subPct < 5;
