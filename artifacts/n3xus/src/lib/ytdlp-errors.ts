@@ -151,9 +151,11 @@ export function parseJobErrorDiagnostic(errorMessage: string): ParsedJobDiagnost
       ? "BOT_CHECK"
       : /2160p|4K/i.test(msg) && /not available|aborted/i.test(msg)
       ? "4K_UNAVAILABLE"
+      : /ENOSPC|No space left on device|disk full/i.test(msg)
+      ? "DISK_FULL"
       : /proxy/i.test(msg)
       ? "PROXY_ERROR"
-      : /stalled|timed out/i.test(msg)
+      : /stalled|timed out|TransportError/i.test(msg)
       ? "STREAM_STALLED"
       : "YTDLP_ERROR");
 
@@ -208,11 +210,11 @@ export function parseJobErrorDiagnostic(errorMessage: string): ParsedJobDiagnost
     case "PROXY_ERROR":
       return {
         code,
-        title: "Download Proxy Connection Failed",
+        title: "Download Proxy Connection Failed / Timed Out",
         summary: cleanMsg,
         tips: [
           "Verify proxy host, port, username, and password in Settings → Download Proxy.",
-          "Click 'Test Connection' in Settings or remove the proxy to test direct server downloads.",
+          "If the proxy timed out contacting YouTube, click 'Remove' in Settings to test direct server downloads or switch to a faster proxy.",
         ],
         showSettingsLink: true,
       };
@@ -227,15 +229,27 @@ export function parseJobErrorDiagnostic(errorMessage: string): ParsedJobDiagnost
         ],
         showSettingsLink: true,
       };
+    case "DISK_FULL":
+      return {
+        code,
+        title: "Insufficient Temporary Storage Space",
+        summary: cleanMsg,
+        tips: [
+          "Render free/default /tmp ephemeral storage fills up quickly with 1–2 GB videos (merging video+audio temporarily requires ~2x the file size).",
+          "Run one large job at a time (published files are automatically deleted immediately after upload completes).",
+          "For reliable 2 GB+ downloads on Render, attach a Render Disk (5–10 GB) and set the VIDEO_STORE_DIR env var to the mounted disk path.",
+        ],
+        showSettingsLink: true,
+      };
     case "STREAM_STALLED":
       return {
         code,
         title: "Download Stalled / Timed Out",
         summary: cleanMsg,
         tips: [
-          "YouTube's media stream stopped transferring data or timed out on the server connection.",
+          "YouTube's API or media stream timed out on the server connection.",
+          "Run 'Test Download Setup' in Settings to verify whether YouTube API & your proxy (if configured) respond cleanly.",
           "Click Retry Mission (or Publish Now if the error happened during No-Download publish).",
-          "For 4K missions, ensure a stable proxy or fresh Netscape cookies in Settings if Render's IP is throttled.",
         ],
         showSettingsLink: true,
       };

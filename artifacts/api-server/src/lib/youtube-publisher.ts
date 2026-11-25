@@ -3,13 +3,13 @@ import { eq, and } from "drizzle-orm";
 import { db, apiTokensTable, publishLogsTable, videoJobsTable, thumbnailsTable, channelsTable } from "@workspace/db";
 import { logger } from "./logger";
 import { downloadVideoWithResilience } from "./ytdlp-downloader";
+import { getVideoStoreDir } from "./ytdlp-config";
 import { getConfig } from "./app-config";
 import { spawn, execFile } from "child_process";
 import { promisify } from "util";
 import { existsSync, statSync, createReadStream } from "fs";
 import { unlink } from "fs/promises";
 import * as path from "path";
-import * as os from "os";
 import { Readable } from "stream";
 
 const execFileAsync = promisify(execFile);
@@ -216,8 +216,8 @@ async function downloadVideoWithYtDlp(
   quality?: string | null,
   opts?: { jobId?: number; signal?: AbortSignal }
 ): Promise<string> {
-  const tmpDir = os.tmpdir();
-  const outputPath = path.join(tmpDir, `n3xus_${Date.now()}.mp4`);
+  const storeDir = getVideoStoreDir();
+  const outputPath = path.join(storeDir, `pub-${opts?.jobId ?? "tmp"}-${Date.now()}.mp4`);
   const progressState = { lastPct: 80, lastAt: 0 };
 
   logger.info({ jobId: opts?.jobId, videoUrl, quality }, "Downloading video via shared resilient yt-dlp pipeline for publish");

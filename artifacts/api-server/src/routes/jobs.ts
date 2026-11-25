@@ -12,10 +12,9 @@ import {
   ApproveJobParams,
 } from "@workspace/api-zod";
 import { generateAiContent } from "../lib/ai-content";
-import { startVideoProcessing } from "../lib/video-processor";
+import { startVideoProcessing, downloadVideoForJob, cleanupJobVideoFile } from "../lib/video-processor";
 import { publishToYouTube, updatePublishLog } from "../lib/youtube-publisher";
 import { publishToFacebook } from "../lib/facebook-publisher";
-import { downloadVideoForJob } from "../lib/video-processor";
 import { registerJobAbort, clearJobAbort, abortActiveJob } from "../lib/job-registry";
 import { existsSync } from "fs";
 
@@ -403,6 +402,7 @@ router.post("/jobs/:id/publish", async (req, res): Promise<void> => {
           .update(videoJobsTable)
           .set({ status: "published", progress: 100, errorMessage: null })
           .where(eq(videoJobsTable.id, id));
+        await cleanupJobVideoFile(id);
       }
     } catch (outerErr) {
       if (pubAbort.signal.aborted) return;

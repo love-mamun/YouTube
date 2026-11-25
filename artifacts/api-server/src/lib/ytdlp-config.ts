@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync, unlinkSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync, unlinkSync, statfsSync } from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as net from "net";
@@ -11,10 +11,59 @@ export const YT_PROXY_DB_KEY = "YTDLP_PROXY_URL";
 export const YT_COOKIES_PATH = "/tmp/n3xus-yt-cookies.txt";
 export const POT_HTTP_URL = process.env.BGUTIL_POT_URL || "http://127.0.0.1:4416";
 
+export function getVideoStoreDir(): string {
+  const custom = process.env.VIDEO_STORE_DIR?.trim();
+  const dir = custom || path.join(os.tmpdir(), "n3xus-video-store");
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+
+export interface DiskSpaceInfo {
+  path: string;
+  persistentConfigured: boolean;
+  totalMB: number | null;
+  availableMB: number | null;
+  usedMB: number | null;
+}
+
+export function getDiskSpaceInfo(targetDir?: string): DiskSpaceInfo {
+  const dir = targetDir || getVideoStoreDir();
+  const persistentConfigured = Boolean(process.env.VIDEO_STORE_DIR?.trim());
+  try {
+    const stats = statfsSync(dir);
+    const bsize = Number(stats.bsize || 4096);
+    const totalBytes = Number(stats.blocks) * bsize;
+    const availBytes = Number(stats.bavail) * bsize;
+    const usedBytes = Math.max(0, totalBytes - availBytes);
+    return {
+      path: dir,
+      persistentConfigured,
+      totalMB: Math.round(totalBytes / (1024 * 1024)),
+      availableMB: Math.round(availBytes / (1024 * 1024)),
+      usedMB: Math.round(usedBytes / (1024 * 1024)),
+    };
+  } catch {
+    return {
+      path: dir,
+      persistentConfigured,
+      totalMB: null,
+      availableMB: null,
+      usedMB: null,
+    };
+  }
+}
+
 const YTDLP_PYTHONPATH = "/home/runner/workspace/.pythonlibs/lib/python3.12/site-packages";
+const BASE_YTDLP_ENV = {
+  ...process.env,
+  NO_PROXY: "127.0.0.1,localhost",
+  no_proxy: "127.0.0.1,localhost",
+};
 export const YTDLP_ENV = existsSync(YTDLP_PYTHONPATH)
-  ? { ...process.env, PYTHONPATH: YTDLP_PYTHONPATH }
-  : { ...process.env };
+  ? { ...BASE_YTDLP_ENV, PYTHONPATH: YTDLP_PYTHONPATH }
+  : BASE_YTDLP_ENV;
 
 export const NODE_BIN = process.execPath ?? "node";
 export const JS_RUNTIME_ARGS = ["--js-runtimes", `node:${NODE_BIN}`];
@@ -454,12 +503,19 @@ export type YtDlpErrorCode =
   | "POT_UNAVAILABLE"
   | "FORMAT_UNAVAILABLE"
   | "STREAM_STALLED"
+  | "DISK_FULL"
   | "CANCELLED"
   | "YTDLP_ERROR";
 
 export function classifyYtDlpError(
   rawMessage: string,
-  context?: { quality?: string | null; usedCookies?: boolean; usedProxy?: boolean; potMode?: string }
+  context?: {
+    quality?: string | null;
+    usedCookies?: boolean;
+    usedProxy?: boolean;
+    proxyMaskedHost?: string | null;
+    potMode?: string;
+  }
 ): { code: YtDlpErrorCode; formattedMessage: string } {
   const msg = rawMessage.trim();
 
@@ -471,10 +527,34 @@ export function classifyYtDlpError(
     return { code: "4K_UNAVAILABLE", formattedMessage: msg };
   }
 
-  if (/stalled|timed out/i.test(msg)) {
+  if (/\[DISK_FULL\]|ENOSPC|No space left on device|Disk quota exceeded/i.test(msg)) {
+    return {
+      code: "DISK_FULL",
+      formattedMessage: `[DISK_FULL] Server temporary disk space is full. Large videos (1-2 GB+) need at least 2x their size during download/merge; attach a Render Persistent Disk with VIDEO_STORE_DIR or wait for active uploads to finish. (${msg.slice(-180)})`,
+    };
+  }
+
+  if (/ProxyError|Unable to connect to proxy|407 Proxy Authentication|SOCKS|proxyconnect/i.test(msg)) {
+    return {
+      code: "PROXY_ERROR",
+      formattedMessage: `[PROXY_ERROR] Download proxy connection or authentication failed${context?.proxyMaskedHost ? ` (${context.proxyMaskedHost})` : ""}. Check or remove your proxy URL in Settings. (${msg.slice(-220)})`,
+    };
+  }
+
+  if (/stalled|timed out|TransportError/i.test(msg)) {
+    if (context?.usedProxy) {
+      return {
+        code: "PROXY_ERROR",
+        formattedMessage: `[PROXY_ERROR] Connection to YouTube timed out via your configured proxy${context.proxyMaskedHost ? ` (${context.proxyMaskedHost})` : ""}. Test or remove the slow/offline proxy in Settings and retry. (${msg.slice(-200)})`,
+      };
+    }
+    const isApiTimeout = /Unable to download API page|TransportError/i.test(msg);
+    const qualLabel = context?.quality ? context.quality : "standard";
     return {
       code: "STREAM_STALLED",
-      formattedMessage: `[STREAM_STALLED] YouTube download stalled or timed out on this connection (${context?.quality ?? "auto"}). Try again, choose a lower quality, or configure a faster proxy in Settings. (${msg.slice(-200)})`,
+      formattedMessage: isApiTimeout
+        ? `[STREAM_STALLED] YouTube API connection timed out (${qualLabel}). Check Settings → Test Download Setup or try a working proxy/cookies. (${msg.slice(-200)})`
+        : `[STREAM_STALLED] YouTube download stalled or timed out on this connection (${qualLabel}). Try again, choose a lower quality, or configure a faster proxy in Settings. (${msg.slice(-200)})`,
     };
   }
 
@@ -482,13 +562,6 @@ export function classifyYtDlpError(
     return {
       code: "RATE_LIMITED_429",
       formattedMessage: `[RATE_LIMITED_429] YouTube returned HTTP 429 (Too Many Requests) for this server IP. Wait a few minutes before retrying, or configure a residential proxy in Settings. (${msg.slice(-220)})`,
-    };
-  }
-
-  if (/ProxyError|Unable to connect to proxy|407 Proxy Authentication|SOCKS|proxyconnect/i.test(msg)) {
-    return {
-      code: "PROXY_ERROR",
-      formattedMessage: `[PROXY_ERROR] Download proxy connection or authentication failed. Check or test your proxy URL in Settings. (${msg.slice(-220)})`,
     };
   }
 

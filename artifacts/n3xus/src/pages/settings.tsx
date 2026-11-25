@@ -219,6 +219,7 @@ export default function Settings() {
     ytDlp: { ok: boolean; version: string | null; error: string | null };
     potServer: { ok: boolean; mode: string; endpoint: string | null };
     proxy: { configured: boolean; maskedHost: string | null; ok: boolean | null; error: string | null };
+    storage?: { path: string; persistentConfigured: boolean; totalMB: number | null; availableMB: number | null; usedMB: number | null };
     cookies: { set: boolean; validation: CookieValidationSummary | null };
     probe: {
       attempted: boolean;
@@ -975,6 +976,24 @@ export default function Settings() {
                     {!diagResult.proxy.configured ? "Direct IP" : diagResult.proxy.ok ? "Reachable" : "Unreachable"}
                   </span>
                 </div>
+                {diagResult.storage && (
+                  <div className="sm:col-span-2 flex items-center justify-between bg-background/50 px-2.5 py-1.5 rounded border border-border/40 gap-2">
+                    <span className="text-muted-foreground truncate">
+                      Temp Video Storage ({diagResult.storage.persistentConfigured ? "Persistent Disk" : "Ephemeral /tmp"})
+                    </span>
+                    <span className={
+                      diagResult.storage.availableMB !== null && diagResult.storage.availableMB >= 4096
+                        ? "text-green-400 shrink-0"
+                        : diagResult.storage.availableMB !== null && diagResult.storage.availableMB >= 1500
+                        ? "text-amber-400 shrink-0"
+                        : "text-destructive shrink-0"
+                    }>
+                      {diagResult.storage.availableMB !== null
+                        ? `${(diagResult.storage.availableMB / 1024).toFixed(2)} GB free`
+                        : "Unknown"}
+                    </span>
+                  </div>
+                )}
               </div>
               {diagResult.proxy.error && (
                 <p className="text-[11px] text-destructive">Proxy error: {diagResult.proxy.error}</p>

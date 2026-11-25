@@ -1,7 +1,6 @@
-import { exec, spawn, execSync } from "child_process";
+import { exec, execFile, spawn } from "child_process";
 import { promisify } from "util";
-import { mkdirSync, existsSync, unlinkSync, writeFileSync, readFileSync, statSync } from "fs";
-import * as os from "os";
+import { mkdirSync, existsSync, unlinkSync, writeFileSync, readFileSync, statSync, readdirSync } from "fs";
 import * as path from "path";
 import { eq, and, inArray } from "drizzle-orm";
 import { db, videoJobsTable, thumbnailsTable, publishLogsTable, apiTokensTable, appConfigTable } from "@workspace/db";
@@ -13,12 +12,13 @@ import {
   downloadVideoWithResilience,
   type YtDlpMeta,
 } from "./ytdlp-downloader";
+import { getVideoStoreDir } from "./ytdlp-config";
 import { registerJobAbort, clearJobAbort } from "./job-registry";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 const FONT_FILE = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
-const VIDEO_TMP_DIR = path.join(os.tmpdir(), "n3xus-video-store");
 const LOGO_PATH = path.resolve(process.cwd(), "artifacts/api-server/assets/watermark-logo.png");
 
 // Resolution → { scale, bitrate } for the FFmpeg pipeline
@@ -140,8 +140,22 @@ async function downloadVideo(
  *   - Re-encode with libx264 + AAC
  * These transforms are the standard suite for making content fingerprint-resistant.
  */
-function pidFilePath(jobId: number) { return `${VIDEO_TMP_DIR}/job-${jobId}-ffmpeg.pid`; }
-function progressFilePath(jobId: number) { return `${VIDEO_TMP_DIR}/job-${jobId}-ffmpeg-progress.txt`; }
+function pidFilePath(jobId: number) { return path.join(getVideoStoreDir(), `job-${jobId}-ffmpeg.pid`); }
+function progressFilePath(jobId: number) { return path.join(getVideoStoreDir(), `job-${jobId}-ffmpeg-progress.txt`); }
+
+async function probeDurationSeconds(filePath: string): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "ffprobe",
+      ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", filePath],
+      { timeout: 10_000 }
+    );
+    const secs = parseFloat(stdout.trim());
+    return !Number.isNaN(secs) && secs > 0 ? secs : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Read out_time_us from FFmpeg -progress file and convert to seconds */
 function readFFmpegProgressSecs(jobId: number): number | null {
@@ -439,8 +453,47 @@ async function waitForDetachedFFmpeg(
 }
 
 /** Safely delete a file if it exists */
-function tryUnlink(path: string) {
-  try { if (existsSync(path)) unlinkSync(path); } catch { /* noop */ }
+function tryUnlink(targetPath: string) {
+  try { if (existsSync(targetPath)) unlinkSync(targetPath); } catch { /* noop */ }
+}
+
+function cleanupJobArtifacts(jobId: number) {
+  try {
+    const dir = getVideoStoreDir();
+    const prefix = `job-${jobId}-`;
+    for (const entry of readdirSync(dir)) {
+      if (entry.startsWith(prefix)) {
+        tryUnlink(path.join(dir, entry));
+      }
+    }
+  } catch {
+    // noop
+  }
+}
+
+export async function cleanupJobVideoFile(jobId: number, explicitPath?: string | null): Promise<void> {
+  try {
+    let targetPath = explicitPath ?? null;
+    if (!targetPath) {
+      const [row] = await db
+        .select({ videoPath: videoJobsTable.videoPath })
+        .from(videoJobsTable)
+        .where(eq(videoJobsTable.id, jobId))
+        .limit(1);
+      targetPath = row?.videoPath ?? null;
+    }
+    if (targetPath && existsSync(targetPath)) {
+      tryUnlink(targetPath);
+    }
+    cleanupJobArtifacts(jobId);
+    await db
+      .update(videoJobsTable)
+      .set({ videoPath: null })
+      .where(eq(videoJobsTable.id, jobId))
+      .catch(() => {});
+  } catch (err) {
+    logger.warn({ err, jobId }, "Failed to clean up job video file after publish");
+  }
 }
 
 async function getWatermarkText(): Promise<string> {
@@ -525,6 +578,8 @@ async function runPublishPipeline(jobId: number, platformsStr: string): Promise<
       .set({ status: "published", progress: 100 })
       .where(eq(videoJobsTable.id, jobId));
 
+    await cleanupJobVideoFile(jobId);
+
     logger.info({ jobId, platforms }, "Auto-publish pipeline completed");
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Publish failed";
@@ -562,8 +617,9 @@ export async function downloadVideoForJob(
   quality = "720p",
   signal?: AbortSignal
 ): Promise<string> {
-  if (!existsSync(VIDEO_TMP_DIR)) mkdirSync(VIDEO_TMP_DIR, { recursive: true });
-  const outputPath = `${VIDEO_TMP_DIR}/job-${jobId}-raw.mp4`;
+  const storeDir = getVideoStoreDir();
+  if (!existsSync(storeDir)) mkdirSync(storeDir, { recursive: true });
+  const outputPath = path.join(storeDir, `job-${jobId}-raw.mp4`);
   logger.info({ jobId, url, quality, outputPath }, "Downloading video for job (pre-publish)");
   let lastPct = 80;
   let lastWriteAt = 0;
@@ -644,9 +700,10 @@ export async function startVideoProcessing(
       // Resumed from after FFmpeg — videoPath already set in DB, skip to Stage 4
       logger.info({ jobId }, "Skipping to content stage (FFmpeg/download already done)");
     } else if (isDownloadJob) {
-      if (!existsSync(VIDEO_TMP_DIR)) mkdirSync(VIDEO_TMP_DIR, { recursive: true });
+      const storeDir = getVideoStoreDir();
+      if (!existsSync(storeDir)) mkdirSync(storeDir, { recursive: true });
 
-      const rawPath = existingRawPath ?? `${VIDEO_TMP_DIR}/job-${jobId}-raw.mp4`;
+      const rawPath = existingRawPath ?? path.join(storeDir, `job-${jobId}-raw.mp4`);
 
       if (skipDownload && existsSync(rawPath)) {
         logger.info({ jobId, rawPath }, "Skipping download — raw file already exists");
@@ -684,9 +741,11 @@ export async function startVideoProcessing(
         await updateJob(jobId, { status: "processing", progress: 45 });
         logger.info({ jobId, quality: jobQuality }, "Starting FFmpeg pipeline");
 
-        const outPath = `${VIDEO_TMP_DIR}/job-${jobId}-processed.mp4`;
+        const outPath = path.join(storeDir, `job-${jobId}-processed.mp4`);
         const watermark = await getWatermarkText();
-        const durationSecs = meta.duration ?? null;
+        const durationSecs = meta.duration ?? (await probeDurationSeconds(rawPath));
+        let lastFfProgress = 45;
+        let lastFfWriteAt = 0;
 
         await processWithFFmpegPipeline(
           rawPath,
@@ -696,8 +755,13 @@ export async function startVideoProcessing(
           durationSecs,
           async (pct) => {
             // Map FFmpeg % (0–100) to overall progress range 45–72%
-            const progress = 45 + Math.floor(pct * 0.27);
-            await updateJob(jobId, { progress });
+            const progress = Math.min(72, 45 + Math.floor(pct * 0.27));
+            const now = Date.now();
+            if (progress > lastFfProgress && (now - lastFfWriteAt >= 1200 || progress - lastFfProgress >= 2)) {
+              lastFfProgress = progress;
+              lastFfWriteAt = now;
+              await updateJob(jobId, { progress }).catch(() => {});
+            }
           },
           jobId,
           jobAbort.signal
@@ -762,8 +826,7 @@ export async function startVideoProcessing(
 
   } catch (err) {
     logger.error({ err, jobId }, "Video processing pipeline failed");
-    tryUnlink(`${VIDEO_TMP_DIR}/job-${jobId}-raw.mp4`);
-    tryUnlink(`${VIDEO_TMP_DIR}/job-${jobId}-processed.mp4`);
+    cleanupJobArtifacts(jobId);
     await updateJob(jobId, {
       status: "failed",
       errorMessage: err instanceof Error ? err.message : "Processing failed",
@@ -806,8 +869,9 @@ export async function resumeStuckJobs(): Promise<void> {
       continue;
     }
 
-    const rawPath       = `${VIDEO_TMP_DIR}/job-${jobId}-raw.mp4`;
-    const processedPath = `${VIDEO_TMP_DIR}/job-${jobId}-processed.mp4`;
+    const storeDir = getVideoStoreDir();
+    const rawPath       = path.join(storeDir, `job-${jobId}-raw.mp4`);
+    const processedPath = path.join(storeDir, `job-${jobId}-processed.mp4`);
     const needsFFmpeg   = job.missionType === "4k" && !!job.quality;
 
     // ── Case 1: FFmpeg is still alive (survived server restart) ──────────────

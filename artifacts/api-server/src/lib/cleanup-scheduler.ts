@@ -1,31 +1,59 @@
 import { readdirSync, statSync, unlinkSync, existsSync } from "fs";
 import * as os from "os";
 import * as path from "path";
-import { eq, isNotNull } from "drizzle-orm";
+import { eq, isNotNull, inArray } from "drizzle-orm";
 import { db, videoJobsTable } from "@workspace/db";
 import { logger } from "./logger";
+import { getVideoStoreDir } from "./ytdlp-config";
 
-const VIDEO_TMP_DIR = path.join(os.tmpdir(), "n3xus-video-store");
-// Files deleted at midnight regardless of age
-
-async function runCleanup() {
-  logger.info("Running scheduled video file cleanup");
+async function runCleanup(options: { onlyOrphaned?: boolean } = {}) {
+  const { onlyOrphaned = false } = options;
+  const storeDir = getVideoStoreDir();
+  logger.info({ onlyOrphaned, storeDir }, "Running scheduled video file cleanup");
 
   let deletedFiles = 0;
   let deletedBytes = 0;
 
-  // Delete ALL video files at midnight
-  if (existsSync(VIDEO_TMP_DIR)) {
+  const protectedJobIds = new Set<number>();
+  if (onlyOrphaned) {
     try {
-      const files = readdirSync(VIDEO_TMP_DIR);
+      const keepRows = await db
+        .select({ id: videoJobsTable.id })
+        .from(videoJobsTable)
+        .where(
+          inArray(videoJobsTable.status, [
+            "pending",
+            "downloading",
+            "processing",
+            "generating",
+            "ready",
+            "approved",
+            "publishing",
+          ])
+        );
+      for (const r of keepRows) protectedJobIds.add(r.id);
+    } catch (e) {
+      logger.warn({ err: e }, "Could not query protected jobs during startup cleanup");
+    }
+  }
+
+  if (existsSync(storeDir)) {
+    try {
+      const files = readdirSync(storeDir);
       for (const file of files) {
-        const fullPath = `${VIDEO_TMP_DIR}/${file}`;
+        if (onlyOrphaned) {
+          const m = file.match(/^job-(\d+)-/);
+          if (m && protectedJobIds.has(parseInt(m[1], 10))) {
+            continue;
+          }
+        }
+        const fullPath = path.join(storeDir, file);
         try {
           const stat = statSync(fullPath);
           deletedBytes += stat.size;
           unlinkSync(fullPath);
           deletedFiles++;
-          logger.info({ file }, "Deleted video file at midnight cleanup");
+          logger.info({ file }, "Deleted stale video file");
         } catch (e) {
           logger.warn({ file, err: e }, "Could not stat/delete file");
         }
@@ -35,7 +63,29 @@ async function runCleanup() {
     }
   }
 
-  // Clear videoPath in DB for jobs whose file was deleted
+  // Also sweep any leftover /tmp/n3xus_*.mp4 publish temps
+  try {
+    const tmpRoot = os.tmpdir();
+    for (const entry of readdirSync(tmpRoot)) {
+      if (entry.startsWith("n3xus_") && entry.endsWith(".mp4")) {
+        const fullPath = path.join(tmpRoot, entry);
+        try {
+          const stat = statSync(fullPath);
+          if (!onlyOrphaned || Date.now() - stat.mtimeMs > 15 * 60 * 1000) {
+            deletedBytes += stat.size;
+            unlinkSync(fullPath);
+            deletedFiles++;
+          }
+        } catch {
+          // noop
+        }
+      }
+    }
+  } catch {
+    // noop
+  }
+
+  // Clear videoPath in DB for jobs whose file no longer exists
   try {
     const jobs = await db
       .select({ id: videoJobsTable.id, videoPath: videoJobsTable.videoPath })
@@ -64,15 +114,14 @@ async function runCleanup() {
 function msUntilMidnight(): number {
   const now = new Date();
   const midnight = new Date(now);
-  midnight.setHours(24, 0, 0, 0); // next midnight
+  midnight.setHours(24, 0, 0, 0);
   return midnight.getTime() - now.getTime();
 }
 
 export function startCleanupScheduler() {
-  // Run once at startup to clear any leftover stale files from previous sessions
-  runCleanup().catch((e) => logger.warn({ err: e }, "Startup cleanup failed"));
+  // On startup only clean orphaned files so active/ready/approved jobs can resume intact
+  runCleanup({ onlyOrphaned: true }).catch((e) => logger.warn({ err: e }, "Startup cleanup failed"));
 
-  // Schedule daily at midnight
   function scheduleNext() {
     const delay = msUntilMidnight();
     const nextMidnight = new Date(Date.now() + delay);
@@ -82,9 +131,9 @@ export function startCleanupScheduler() {
     );
 
     setTimeout(() => {
-      runCleanup()
+      runCleanup({ onlyOrphaned: false })
         .catch((e) => logger.warn({ err: e }, "Midnight cleanup failed"))
-        .finally(() => scheduleNext()); // re-schedule for next midnight
+        .finally(() => scheduleNext());
     }, delay);
   }
 

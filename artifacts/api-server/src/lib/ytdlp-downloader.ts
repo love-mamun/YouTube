@@ -13,6 +13,9 @@ import {
   detectPotProvider,
   classifyYtDlpError,
   maskProxyUrl,
+  getVideoStoreDir,
+  getDiskSpaceInfo,
+  type DiskSpaceInfo,
   type YtDlpErrorCode,
 } from "./ytdlp-config";
 
@@ -119,6 +122,25 @@ function getPrefixFileBytes(targetOutputPath: string): number {
   }
 }
 
+function cleanupPrefixFiles(targetOutputPath: string): void {
+  try {
+    const dir = path.dirname(targetOutputPath);
+    const base = path.basename(targetOutputPath, ".mp4");
+    const entries = readdirSync(dir);
+    for (const name of entries) {
+      if (name.startsWith(base)) {
+        try {
+          unlinkSync(path.join(dir, name));
+        } catch {
+          // noop
+        }
+      }
+    }
+  } catch {
+    // noop
+  }
+}
+
 interface SpawnYtDlpOptions {
   onProgress?: (pct: number) => void;
   timeoutMs?: number;
@@ -150,8 +172,9 @@ function spawnYtDlpRaw(
     let lastActivityAt = Date.now();
     let lastWatchedBytes = watchOutputPath ? getPrefixFileBytes(watchOutputPath) : 0;
 
+    const storeDir = getVideoStoreDir();
     const proc = spawn("python3", ["-m", "yt_dlp", ...args], {
-      env: { ...YTDLP_ENV, PYTHONUNBUFFERED: "1" },
+      env: { ...YTDLP_ENV, PYTHONUNBUFFERED: "1", TMPDIR: storeDir },
     });
 
     const cleanupTimers = () => {
@@ -262,36 +285,50 @@ export async function fetchYtDlpMetadataShared(url: string): Promise<YtDlpMeta> 
 
   try {
     const strategies = buildStrategies(cookieCopy.hasCookies, pot.mode !== "none");
-    const chosen = strategies[0];
-    const extractorVal = chosen.useMissingPotFlag
-      ? `youtube:player_client=${chosen.client};formats=missing_pot`
-      : `youtube:player_client=${chosen.client}`;
-
-    const args: string[] = [
-      "--dump-json",
-      "--no-playlist",
-      "--skip-download",
-      "--ignore-no-formats-error",
-      "--force-ipv4",
-      "--socket-timeout", "15",
-      "--retries", "1",
-      ...JS_RUNTIME_ARGS,
-      ...(chosen.usePot ? pot.extractorArgs : []),
-      "--extractor-args", extractorVal,
-      ...(chosen.useCookies && cookieCopy.path ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA] : []),
-      ...(proxyUrl ? ["--proxy", proxyUrl] : []),
-      url,
-    ];
-
-    const { stdout } = await spawnYtDlpRaw(args, { timeoutMs: 35_000, stallTimeoutMs: 30_000 });
-    const raw = stdout.trim();
-    if (raw) {
-      return JSON.parse(raw) as YtDlpMeta;
+    // Try primary strategy, and if it fails fall back to an android_vr client without cookies
+    const candidates: ClientStrategy[] = [strategies[0]];
+    const fallbackVr = strategies.find((s) => s.client === "android_vr") ?? {
+      client: "android_vr",
+      useCookies: false,
+      usePot: false,
+      useMissingPotFlag: true,
+    };
+    if (fallbackVr.client !== strategies[0].client) {
+      candidates.push(fallbackVr);
     }
-    return {};
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.warn({ url, err: msg.slice(0, 260) }, "yt-dlp metadata fetch failed");
+
+    for (const chosen of candidates) {
+      const extractorVal = chosen.useMissingPotFlag
+        ? `youtube:player_client=${chosen.client};formats=missing_pot`
+        : `youtube:player_client=${chosen.client}`;
+
+      const args: string[] = [
+        "--dump-json",
+        "--no-playlist",
+        "--skip-download",
+        "--ignore-no-formats-error",
+        "--socket-timeout", "25",
+        "--retries", "1",
+        "--extractor-retries", "1",
+        ...JS_RUNTIME_ARGS,
+        ...(chosen.usePot ? pot.extractorArgs : []),
+        "--extractor-args", extractorVal,
+        ...(chosen.useCookies && cookieCopy.path ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA] : []),
+        ...(proxyUrl ? ["--proxy", proxyUrl] : []),
+        url,
+      ];
+
+      try {
+        const { stdout } = await spawnYtDlpRaw(args, { timeoutMs: 45_000, stallTimeoutMs: 35_000 });
+        const raw = stdout.trim();
+        if (raw) {
+          return JSON.parse(raw) as YtDlpMeta;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn({ url, client: chosen.client, err: msg.slice(0, 220) }, "yt-dlp metadata strategy failed");
+      }
+    }
     return {};
   } finally {
     cookieCopy.cleanup();
@@ -319,23 +356,21 @@ export async function downloadVideoWithResilience(options: {
       formatSelectors.push(
         `bestvideo*[height>=2160]${vcodecFilter}+bestaudio/bestvideo*[height>=2160]+bestaudio`
       );
+    } else {
+      formatSelectors.push(
+        "bestvideo*[height>=2160]+bestaudio/best[height>=2160]"
+      );
     }
-    formatSelectors.push(
-      "bestvideo*[height>=2160]+bestaudio/best[height>=2160]"
-    );
   } else if (quality) {
     if (vcodecFilter) {
       formatSelectors.push(
-        `bestvideo*[height<=${maxH}]${vcodecFilter}+bestaudio/bestvideo*[height<=${maxH}]+bestaudio/b[height<=${maxH}]`
+        `bestvideo*[height<=${maxH}]${vcodecFilter}+bestaudio/bestvideo*[height<=${maxH}]+bestaudio/b[height<=${maxH}]/b`
       );
     } else {
       formatSelectors.push(
-        `bestvideo*[height<=${maxH}]+bestaudio/b[height<=${maxH}]`
+        `bestvideo*[height<=${maxH}]+bestaudio/b[height<=${maxH}]/b`
       );
     }
-    formatSelectors.push(
-      `bestvideo*[height<=${maxH}]+bestaudio/bestvideo*[height<=1080]+bestaudio/b`
-    );
   } else {
     // Metadata-only ("No Download") fallback download at publish time:
     // Cap to 1080p MP4-compatible streams so publishing doesn't pull massive 4K/8K files unexpectedly.
@@ -345,8 +380,17 @@ export async function downloadVideoWithResilience(options: {
   }
 
   const uniqueFormats = Array.from(new Set(formatSelectors));
+  const storeDir = getVideoStoreDir();
+  const diskInfo = getDiskSpaceInfo(storeDir);
+  if (diskInfo.availableMB !== null && diskInfo.availableMB < 200) {
+    throw new Error(
+      `[DISK_FULL] Only ${diskInfo.availableMB} MB free in ${storeDir}. Need at least 200 MB free space to start download.`
+    );
+  }
+
   const cookieCopy = await acquireJobCookieCopy(jobTag);
   const proxyUrl = await getStoredProxyUrl();
+  const maskedProxy = proxyUrl ? maskProxyUrl(proxyUrl) : null;
   const pot = await detectPotProvider();
   const strategies = buildStrategies(cookieCopy.hasCookies, pot.mode !== "none");
 
@@ -356,12 +400,11 @@ export async function downloadVideoWithResilience(options: {
     "--no-check-formats",
     "--newline",
     "--progress",
-    "--force-ipv4",
-    "--socket-timeout", "20",
-    "--concurrent-fragments", "4",
-    "--sleep-requests", "1",
+    "--socket-timeout", "40",
+    "--concurrent-fragments", proxyUrl ? "1" : "2",
     "--retries", "2",
     "--extractor-retries", "2",
+    "--paths", `temp:${storeDir}`,
     ...JS_RUNTIME_ARGS,
     ...(proxyUrl ? ["--proxy", proxyUrl] : []),
     "-o", outputPath,
@@ -372,9 +415,10 @@ export async function downloadVideoWithResilience(options: {
   let botCheckHit = false;
   let formatMiss4KHit = false;
   let stallHits = 0;
+  let proxyTimeoutHits = 0;
 
   const perAttemptTotalMs = isStrict4K ? 720_000 : 360_000;
-  const perAttemptStallMs = isStrict4K ? 95_000 : 75_000;
+  const perAttemptStallMs = isStrict4K ? 105_000 : 85_000;
 
   try {
     for (let sIdx = 0; sIdx < strategies.length; sIdx++) {
@@ -400,15 +444,14 @@ export async function downloadVideoWithResilience(options: {
             isStrict4K,
             hasCookies: strat.useCookies && cookieCopy.hasCookies,
             potMode: strat.usePot ? pot.mode : "none",
-            proxy: proxyUrl ? maskProxyUrl(proxyUrl) : null,
+            proxy: maskedProxy,
+            freeDiskMB: diskInfo.availableMB,
           },
           "Trying yt-dlp download strategy"
         );
 
         try {
-          if (existsSync(outputPath)) {
-            try { unlinkSync(outputPath); } catch { /* noop */ }
-          }
+          cleanupPrefixFiles(outputPath);
 
           await spawnYtDlpRaw(
             [
@@ -445,6 +488,8 @@ export async function downloadVideoWithResilience(options: {
           return;
         } catch (err) {
           lastError = err instanceof Error ? err.message : String(err);
+          cleanupPrefixFiles(outputPath);
+
           if (signal?.aborted || /Stopped by user|\[CANCELLED\]/i.test(lastError)) {
             throw new Error("[CANCELLED] Stopped by user");
           }
@@ -454,15 +499,43 @@ export async function downloadVideoWithResilience(options: {
             "yt-dlp strategy failed"
           );
 
-          if (/ProxyError|Unable to connect to proxy|407 Proxy Authentication|SOCKS/i.test(lastError)) {
+          if (/ENOSPC|No space left on device|Disk quota exceeded|\[DISK_FULL\]/i.test(lastError)) {
             throw new Error(
               classifyYtDlpError(lastError, {
                 quality,
                 usedCookies: cookieCopy.hasCookies,
                 usedProxy: Boolean(proxyUrl),
+                proxyMaskedHost: maskedProxy,
                 potMode: pot.mode,
               }).formattedMessage
             );
+          }
+
+          if (/ProxyError|Unable to connect to proxy|407 Proxy Authentication|SOCKS|proxyconnect/i.test(lastError)) {
+            throw new Error(
+              classifyYtDlpError(lastError, {
+                quality,
+                usedCookies: cookieCopy.hasCookies,
+                usedProxy: Boolean(proxyUrl),
+                proxyMaskedHost: maskedProxy,
+                potMode: pot.mode,
+              }).formattedMessage
+            );
+          }
+
+          if (proxyUrl && /timed out|TransportError|stalled/i.test(lastError)) {
+            proxyTimeoutHits++;
+            if (proxyTimeoutHits >= 2) {
+              throw new Error(
+                classifyYtDlpError(lastError, {
+                  quality,
+                  usedCookies: cookieCopy.hasCookies,
+                  usedProxy: true,
+                  proxyMaskedHost: maskedProxy,
+                  potMode: pot.mode,
+                }).formattedMessage
+              );
+            }
           }
 
           if (/429|Too Many Requests/i.test(lastError)) {
@@ -473,6 +546,7 @@ export async function downloadVideoWithResilience(options: {
                   quality,
                   usedCookies: cookieCopy.hasCookies,
                   usedProxy: Boolean(proxyUrl),
+                  proxyMaskedHost: maskedProxy,
                   potMode: pot.mode,
                 }).formattedMessage
               );
@@ -487,16 +561,16 @@ export async function downloadVideoWithResilience(options: {
             formatMiss4KHit = true;
           }
 
-          if (/stalled/i.test(lastError)) {
+          if (/stalled|timed out/i.test(lastError)) {
             stallHits++;
           }
 
-          await sleep(1200, signal);
+          await sleep(1000, signal);
         }
       }
 
       if (sIdx < strategies.length - 1) {
-        await sleep(1500, signal);
+        await sleep(1200, signal);
       }
     }
 
@@ -507,7 +581,7 @@ export async function downloadVideoWithResilience(options: {
         ? `Sign in to confirm you're not a bot (${lastError})`
         : formatMiss4KHit && isStrict4K && !/4K_UNAVAILABLE/i.test(lastError)
         ? `Requested format is not available for 2160p (${lastError})`
-        : stallHits > 0 && !/stalled/i.test(lastError)
+        : stallHits > 0 && !/stalled|timed out/i.test(lastError)
         ? `Download stalled waiting on YouTube stream (${lastError})`
         : lastError;
 
@@ -515,6 +589,7 @@ export async function downloadVideoWithResilience(options: {
       quality,
       usedCookies: cookieCopy.hasCookies,
       usedProxy: Boolean(proxyUrl),
+      proxyMaskedHost: maskedProxy,
       potMode: pot.mode,
     });
     throw new Error(classified.formattedMessage);
@@ -527,6 +602,7 @@ export interface DiagnosticsReport {
   ytDlp: { ok: boolean; version: string | null; error: string | null };
   potServer: { ok: boolean; mode: "http" | "script" | "none"; endpoint: string | null };
   proxy: { configured: boolean; maskedHost: string | null; ok: boolean | null; error: string | null };
+  storage: DiskSpaceInfo;
   probe: {
     attempted: boolean;
     ok: boolean | null;
@@ -553,8 +629,10 @@ export async function runYtDlpDiagnostics(opts: {
   }
 
   const pot = await detectPotProvider();
+  const storage = getDiskSpaceInfo();
 
   const effectiveProxy = opts.proxyOverride !== undefined ? opts.proxyOverride : await getStoredProxyUrl();
+  const maskedEffectiveProxy = effectiveProxy ? maskProxyUrl(effectiveProxy) : null;
   let proxyOk: boolean | null = null;
   let proxyErr: string | null = null;
 
@@ -589,10 +667,11 @@ export async function runYtDlpDiagnostics(opts: {
     },
     proxy: {
       configured: Boolean(effectiveProxy),
-      maskedHost: effectiveProxy ? maskProxyUrl(effectiveProxy) : null,
+      maskedHost: maskedEffectiveProxy,
       ok: proxyOk,
       error: proxyErr,
     },
+    storage,
     probe: {
       attempted: false,
       ok: null,
@@ -627,8 +706,7 @@ export async function runYtDlpDiagnostics(opts: {
         "--simulate",
         "--no-playlist",
         "--skip-download",
-        "--force-ipv4",
-        "--socket-timeout", "15",
+        "--socket-timeout", "25",
         ...JS_RUNTIME_ARGS,
         ...(chosen.usePot ? pot.extractorArgs : []),
         "--extractor-args", extractorVal,
@@ -636,7 +714,7 @@ export async function runYtDlpDiagnostics(opts: {
         ...(effectiveProxy ? ["--proxy", effectiveProxy] : []),
         targetUrl,
       ],
-      { timeoutMs: 30_000, stallTimeoutMs: 25_000 }
+      { timeoutMs: 40_000, stallTimeoutMs: 35_000 }
     );
 
     const parsed = JSON.parse(stdout) as { formats?: Array<{ height?: number; vcodec?: string }> };
@@ -656,6 +734,7 @@ export async function runYtDlpDiagnostics(opts: {
     const classified = classifyYtDlpError(raw, {
       usedCookies: cookieCopy.hasCookies,
       usedProxy: Boolean(effectiveProxy),
+      proxyMaskedHost: maskedEffectiveProxy,
       potMode: pot.mode,
     });
     report.probe.ok = false;
