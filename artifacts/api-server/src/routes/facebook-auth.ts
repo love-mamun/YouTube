@@ -11,23 +11,42 @@ function getRedirectUri(origin: string) {
   return `${origin}/api/auth/facebook/callback`;
 }
 
-function getOrigin() {
-  if (process.env.APP_URL) return process.env.APP_URL;
-  if (process.env.RENDER_EXTERNAL_URL) return process.env.RENDER_EXTERNAL_URL;
+function getRequestOrigin(req?: {
+  protocol?: string;
+  get: (name: string) => string | undefined;
+}): string | null {
+  if (!req) return null;
+  const host = req.get("x-forwarded-host") || req.get("host");
+  if (!host) return null;
+  const proto = (req.get("x-forwarded-proto") || req.protocol || "https")
+    .split(",")[0]
+    .trim();
+  return `${proto}://${host}`;
+}
+
+function getOrigin(req?: {
+  protocol?: string;
+  get: (name: string) => string | undefined;
+}) {
   const domains = process.env.REPLIT_DOMAINS?.split(",") ?? [];
   const primary = domains[0];
-  return primary ? `https://${primary}` : "http://localhost:3000";
+  const raw =
+    process.env.APP_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    getRequestOrigin(req) ||
+    (primary ? `https://${primary}` : "http://localhost:3000");
+  return raw.replace(/\/+$/, "");
 }
 
 // ── Step 1: Start Facebook OAuth ─────────────────────────────────────────────
-router.get("/auth/facebook", async (_req, res): Promise<void> => {
+router.get("/auth/facebook", async (req, res): Promise<void> => {
   try {
-    const appId = await getConfig("FACEBOOK_APP_ID");
+    const appId = (await getConfig("FACEBOOK_APP_ID"))?.trim();
     if (!appId) {
       res.status(400).json({ error: "FACEBOOK_APP_ID is not configured — add it in Settings first." });
       return;
     }
-    const redirectUri = encodeURIComponent(getRedirectUri(getOrigin()));
+    const redirectUri = encodeURIComponent(getRedirectUri(getOrigin(req)));
     const scopes = "pages_show_list,pages_manage_posts,pages_read_engagement,business_management";
     const url = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${appId}&redirect_uri=${redirectUri}&scope=${scopes}&response_type=code&auth_type=rerequest`;
     res.redirect(url);
@@ -49,11 +68,11 @@ router.get("/auth/facebook/callback", async (req, res): Promise<void> => {
   }
 
   try {
-    const appId = await getConfig("FACEBOOK_APP_ID");
-    const appSecret = await getConfig("FACEBOOK_APP_SECRET");
+    const appId = (await getConfig("FACEBOOK_APP_ID"))?.trim();
+    const appSecret = (await getConfig("FACEBOOK_APP_SECRET"))?.trim();
     if (!appId || !appSecret) throw new Error("Facebook App ID and Secret not configured");
 
-    const origin = getOrigin();
+    const origin = getOrigin(req);
     const redirectUri = encodeURIComponent(getRedirectUri(origin));
 
     // Exchange code for short-lived user token

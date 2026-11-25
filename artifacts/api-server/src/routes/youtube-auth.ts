@@ -7,9 +7,25 @@ import { getConfig } from "../lib/app-config";
 
 const router: IRouter = Router();
 
-async function getOAuthClient() {
-  const clientId = await getConfig("YOUTUBE_CLIENT_ID");
-  const clientSecret = await getConfig("YOUTUBE_CLIENT_SECRET");
+function getRequestOrigin(req?: {
+  protocol?: string;
+  get: (name: string) => string | undefined;
+}): string | null {
+  if (!req) return null;
+  const host = req.get("x-forwarded-host") || req.get("host");
+  if (!host) return null;
+  const proto = (req.get("x-forwarded-proto") || req.protocol || "https")
+    .split(",")[0]
+    .trim();
+  return `${proto}://${host}`;
+}
+
+async function getOAuthClient(req?: {
+  protocol?: string;
+  get: (name: string) => string | undefined;
+}) {
+  const clientId = (await getConfig("YOUTUBE_CLIENT_ID"))?.trim();
+  const clientSecret = (await getConfig("YOUTUBE_CLIENT_SECRET"))?.trim();
   if (!clientId || !clientSecret) {
     throw new Error(
       "YouTube credentials are not configured. Add YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET in Settings.",
@@ -18,10 +34,12 @@ async function getOAuthClient() {
 
   const domains = process.env.REPLIT_DOMAINS?.split(",") ?? [];
   const primaryDomain = domains[0];
-  const redirectBase =
+  const rawBase =
     process.env.APP_URL ||
     process.env.RENDER_EXTERNAL_URL ||
+    getRequestOrigin(req) ||
     (primaryDomain ? `https://${primaryDomain}` : "http://localhost:3000");
+  const redirectBase = rawBase.replace(/\/+$/, "");
 
   return new google.auth.OAuth2(
     clientId,
@@ -30,10 +48,26 @@ async function getOAuthClient() {
   );
 }
 
+function extractOAuthErrorReason(err: unknown): string {
+  const anyErr = err as {
+    message?: string;
+    response?: {
+      data?: {
+        error_description?: string;
+        error?: string | { message?: string };
+      };
+    };
+  };
+  const apiDesc = anyErr?.response?.data?.error_description;
+  const apiErr = anyErr?.response?.data?.error;
+  const apiMsg = typeof apiErr === "string" ? apiErr : apiErr?.message;
+  return apiDesc || apiMsg || anyErr?.message || "Unknown OAuth error";
+}
+
 // ── Step 1: Start OAuth flow ─────────────────────────────────────────────────
 router.get("/auth/youtube", async (req, res): Promise<void> => {
   try {
-    const oauth2Client = await getOAuthClient();
+    const oauth2Client = await getOAuthClient(req);
     const scopes = [
       "https://www.googleapis.com/auth/youtube.upload",
       "https://www.googleapis.com/auth/youtube.readonly",
@@ -52,15 +86,28 @@ router.get("/auth/youtube", async (req, res): Promise<void> => {
 
 // ── Step 2: OAuth callback — exchange code, store new channel ───────────────
 router.get("/auth/youtube/callback", async (req, res): Promise<void> => {
+  const oauthError = req.query.error as string | undefined;
+  if (oauthError) {
+    const reason = String(req.query.error_description || oauthError);
+    logger.warn({ oauthError, reason }, "YouTube OAuth denied by Google");
+    res.redirect(`/settings?oauth=youtube_error&reason=${encodeURIComponent(reason)}`);
+    return;
+  }
+
   const code = req.query.code as string;
   if (!code) {
-    res.status(400).send("Missing OAuth code");
+    res.redirect(
+      `/settings?oauth=youtube_error&reason=${encodeURIComponent("Missing OAuth authorization code from Google.")}`,
+    );
     return;
   }
 
   try {
-    const oauth2Client = await getOAuthClient();
+    const oauth2Client = await getOAuthClient(req);
     const { tokens } = await oauth2Client.getToken(code);
+    if (!tokens.access_token) {
+      throw new Error("Google did not return an access token.");
+    }
     oauth2Client.setCredentials(tokens);
 
     const yt = google.youtube({ version: "v3", auth: oauth2Client });
@@ -88,23 +135,55 @@ router.get("/auth/youtube/callback", async (req, res): Promise<void> => {
 
     let tokenId: number;
 
-    if (existingChannel.length > 0) {
+    if (existingChannel.length > 0 && existingChannel[0].tokenId) {
       // Update the existing token for this channel
       const [updatedToken] = await db
         .update(apiTokensTable)
         .set({
-          accessToken: tokens.access_token!,
+          accessToken: tokens.access_token,
           refreshToken: tokens.refresh_token ?? undefined,
           label: channelName,
           isActive: true,
         })
-        .where(eq(apiTokensTable.id, existingChannel[0].tokenId!))
+        .where(eq(apiTokensTable.id, existingChannel[0].tokenId))
         .returning();
-      tokenId = updatedToken.id;
+
+      if (updatedToken) {
+        tokenId = updatedToken.id;
+      } else {
+        const [newToken] = await db
+          .insert(apiTokensTable)
+          .values({
+            platform: "youtube",
+            accessToken: tokens.access_token,
+            refreshToken: tokens.refresh_token ?? null,
+            label: channelName,
+            isActive: true,
+          })
+          .returning();
+        tokenId = newToken.id;
+      }
 
       await db
         .update(channelsTable)
-        .set({ channelName, thumbnailUrl, subscriberCount, isActive: true })
+        .set({ channelName, thumbnailUrl, subscriberCount, tokenId, isActive: true })
+        .where(eq(channelsTable.id, existingChannel[0].id));
+    } else if (existingChannel.length > 0) {
+      const [newToken] = await db
+        .insert(apiTokensTable)
+        .values({
+          platform: "youtube",
+          accessToken: tokens.access_token,
+          refreshToken: tokens.refresh_token ?? null,
+          label: channelName,
+          isActive: true,
+        })
+        .returning();
+      tokenId = newToken.id;
+
+      await db
+        .update(channelsTable)
+        .set({ channelName, thumbnailUrl, subscriberCount, tokenId, isActive: true })
         .where(eq(channelsTable.id, existingChannel[0].id));
     } else {
       // New channel — insert fresh token + channel row
@@ -112,7 +191,7 @@ router.get("/auth/youtube/callback", async (req, res): Promise<void> => {
         .insert(apiTokensTable)
         .values({
           platform: "youtube",
-          accessToken: tokens.access_token!,
+          accessToken: tokens.access_token,
           refreshToken: tokens.refresh_token ?? null,
           label: channelName,
           isActive: true,
@@ -142,8 +221,9 @@ router.get("/auth/youtube/callback", async (req, res): Promise<void> => {
     logger.info({ channelName, channelId }, "YouTube channel connected");
     res.redirect("/settings?oauth=youtube_connected");
   } catch (err) {
-    logger.error({ err }, "YouTube OAuth callback failed");
-    res.redirect("/settings?oauth=youtube_error");
+    const reason = extractOAuthErrorReason(err);
+    logger.error({ err, reason }, "YouTube OAuth callback failed");
+    res.redirect(`/settings?oauth=youtube_error&reason=${encodeURIComponent(reason)}`);
   }
 });
 

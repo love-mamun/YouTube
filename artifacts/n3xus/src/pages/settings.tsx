@@ -354,8 +354,13 @@ export default function Settings() {
       queryClient.invalidateQueries({ queryKey: getListTokensQueryKey() });
       queryClient.invalidateQueries({ queryKey: getListChannelsQueryKey() });
     } else if (oauth === "youtube_error") {
+      const reason = params.get("reason");
       window.history.replaceState({}, "", window.location.pathname);
-      setOauthError("YouTube connection failed. Check your Client ID and Secret are correct and the redirect URI is configured in Google Cloud Console.");
+      setOauthError(
+        reason
+          ? `YouTube connection failed: ${reason}`
+          : "YouTube connection failed. Check your Client ID and Secret are correct and the redirect URI is configured in Google Cloud Console.",
+      );
     } else if (oauth === "facebook_connected") {
       const pages = params.get("pages");
       window.history.replaceState({}, "", window.location.pathname);
