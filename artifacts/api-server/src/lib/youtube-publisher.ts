@@ -2,6 +2,7 @@ import { google } from "googleapis";
 import { eq, and } from "drizzle-orm";
 import { db, apiTokensTable, publishLogsTable, videoJobsTable, thumbnailsTable, channelsTable } from "@workspace/db";
 import { logger } from "./logger";
+import { downloadVideoWithResilience } from "./ytdlp-downloader";
 import { getConfig } from "./app-config";
 import { spawn } from "child_process";
 import { existsSync } from "fs";
@@ -188,67 +189,20 @@ async function getYouTubeClient(channelId?: number | null) {
   return google.youtube({ version: "v3", auth: oauth2Client });
 }
 
-function spawnAsync(cmd: string, args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-    const proc = spawn(cmd, args, { timeout: timeoutMs });
-    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    proc.on("close", (code) => {
-      if (code !== 0) reject(new Error(`${cmd} exited with code ${code}: ${stderr.slice(0, 500)}`));
-      else resolve({ stdout, stderr });
-    });
-    proc.on("error", reject);
-  });
-}
-
 async function downloadVideoWithYtDlp(videoUrl: string, quality?: string | null): Promise<string> {
   const tmpDir = os.tmpdir();
-  const outTemplate = path.join(tmpDir, `n3xus_${Date.now()}.%(ext)s`);
+  const outputPath = path.join(tmpDir, `n3xus_${Date.now()}.mp4`);
 
-  logger.info({ videoUrl, quality }, "Downloading video with yt-dlp for publish");
+  logger.info({ videoUrl, quality }, "Downloading video via shared resilient yt-dlp pipeline for publish");
 
-  // Build a height-constrained format selector matching the job's chosen quality
-  const heightMap: Record<string, number> = {
-    "360p": 360, "480p": 480, "720p": 720,
-    "1080p": 1080, "1440p": 1440, "4k": 2160,
-  };
-  const maxH = quality ? (heightMap[quality] ?? null) : null;
+  await downloadVideoWithResilience({
+    url: videoUrl,
+    quality: quality ?? null,
+    outputPath,
+    jobTag: "pub",
+  });
 
-  const buildFmt = (h: number | null) =>
-    h
-      ? `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`
-      : `bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best`;
-
-  const commonFlags = [
-    "--extractor-args", "youtube:player_client=android,web",
-    "--no-part",
-    "--merge-output-format", "mp4",
-    "-o", outTemplate,
-  ];
-
-  try {
-    await spawnAsync("yt-dlp", ["-f", buildFmt(maxH), ...commonFlags, videoUrl], 300_000);
-  } catch (firstErr) {
-    logger.warn({ firstErr }, "yt-dlp first attempt failed, retrying with relaxed format");
-    await spawnAsync("yt-dlp", ["-f", "best", ...commonFlags, videoUrl], 300_000);
-  }
-
-  const mp4Path = outTemplate.replace("%(ext)s", "mp4");
-  if (existsSync(mp4Path)) return mp4Path;
-
-  // Probe actual filename yt-dlp chose
-  const { stdout } = await spawnAsync("yt-dlp", [
-    "--get-filename",
-    "-f", buildFmt(maxH),
-    "--extractor-args", "youtube:player_client=android,web",
-    "-o", outTemplate,
-    videoUrl,
-  ], 30_000);
-
-  const actualPath = stdout.trim();
-  if (actualPath && existsSync(actualPath)) return actualPath;
+  if (existsSync(outputPath)) return outputPath;
 
   throw new Error("Downloaded file not found after yt-dlp");
 }

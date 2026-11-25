@@ -1,9 +1,18 @@
-import { Router, type IRouter } from "express";
+import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import { eq } from "drizzle-orm";
 import { writeFileSync, existsSync, unlinkSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import * as path from "path";
 import { db, appConfigTable } from "@workspace/db";
+import {
+  YT_COOKIES_DB_KEY,
+  YT_COOKIES_PATH,
+  YT_PROXY_DB_KEY,
+  validateNetscapeCookies,
+  validateAndNormalizeProxyUrl,
+  getMaskedProxyStatus,
+} from "../lib/ytdlp-config";
+import { runYtDlpDiagnostics } from "../lib/ytdlp-downloader";
 
 const ASSETS_DIR     = path.resolve(process.cwd(), "artifacts/api-server/assets");
 const LOGO_FILE_PATH = path.join(ASSETS_DIR, "watermark-logo.png");
@@ -20,25 +29,15 @@ const ALLOWED_KEYS = [
 
 type AllowedKey = (typeof ALLOWED_KEYS)[number];
 
-export const YT_COOKIES_PATH = "/tmp/n3xus-yt-cookies.txt";
-const YT_COOKIES_DB_KEY = "yt_cookies";
+export { YT_COOKIES_PATH };
 
-// Restore cookies file from DB on startup
-async function restoreCookiesFile() {
-  try {
-    const [row] = await db
-      .select()
-      .from(appConfigTable)
-      .where(eq(appConfigTable.key, YT_COOKIES_DB_KEY))
-      .limit(1);
-    if (row?.value) {
-      writeFileSync(YT_COOKIES_PATH, row.value, "utf-8");
-    }
-  } catch {
-    // noop
+function requireSettingsAuth(req: Request, res: Response, next: NextFunction): void {
+  if (req.session?.settingsAuthed !== true) {
+    res.status(401).json({ error: "Settings access locked. Unlock Settings first." });
+    return;
   }
+  next();
 }
-restoreCookiesFile();
 
 // GET /api/settings/credentials — returns which keys are set (values masked)
 router.get("/settings/credentials", async (_req, res): Promise<void> => {
@@ -92,7 +91,7 @@ router.post("/settings/credentials", async (req, res): Promise<void> => {
 
 // DELETE /api/settings/credentials/:key — remove a credential
 router.delete("/settings/credentials/:key", async (req, res): Promise<void> => {
-  const key = req.params.key;
+  const key = Array.isArray(req.params.key) ? req.params.key[0] : req.params.key;
   if (!ALLOWED_KEYS.includes(key as AllowedKey)) {
     res.status(400).json({ error: "Unknown credential key" });
     return;
@@ -103,22 +102,51 @@ router.delete("/settings/credentials/:key", async (req, res): Promise<void> => {
 
 // ── YouTube Cookies ─────────────────────────────────────────────────────────
 
-// GET /api/settings/yt-cookies — returns { set: bool, updatedAt }
+// GET /api/settings/yt-cookies — returns { set, updatedAt, validation } (never plaintext cookies)
 router.get("/settings/yt-cookies", async (_req, res): Promise<void> => {
   const [row] = await db
-    .select({ updatedAt: appConfigTable.updatedAt })
+    .select({ value: appConfigTable.value, updatedAt: appConfigTable.updatedAt })
     .from(appConfigTable)
     .where(eq(appConfigTable.key, YT_COOKIES_DB_KEY))
     .limit(1);
-  res.json({ set: !!row, updatedAt: row?.updatedAt?.toISOString() ?? null });
+
+  if (!row?.value) {
+    res.json({ set: false, updatedAt: null, validation: null });
+    return;
+  }
+
+  const validation = validateNetscapeCookies(row.value);
+  res.json({
+    set: true,
+    updatedAt: row.updatedAt.toISOString(),
+    validation,
+  });
 });
 
-// POST /api/settings/yt-cookies — save Netscape cookie file content
-router.post("/settings/yt-cookies", async (req, res): Promise<void> => {
+// POST /api/settings/yt-cookies — validate & save Netscape cookie file content
+router.post("/settings/yt-cookies", requireSettingsAuth, async (req, res): Promise<void> => {
   const body = req.body as { cookies?: string };
   const content = (body?.cookies ?? "").trim();
   if (!content) {
     res.status(400).json({ error: "No cookies content provided" });
+    return;
+  }
+
+  const validation = validateNetscapeCookies(content);
+  if (validation.status === "invalid_format" || validation.status === "not_youtube") {
+    res.status(400).json({
+      error: validation.warnings[0] || "Invalid Netscape YouTube cookie file.",
+      validation,
+    });
+    return;
+  }
+  if (validation.status === "missing_auth" || validation.status === "expired") {
+    res.status(400).json({
+      error:
+        validation.warnings[0] ||
+        "Cookies are expired or do not include an active YouTube login session. Re-export while signed in.",
+      validation,
+    });
     return;
   }
 
@@ -130,17 +158,106 @@ router.post("/settings/yt-cookies", async (req, res): Promise<void> => {
       set: { value: content, updatedAt: new Date() },
     });
 
-  // Write to disk for immediate use by yt-dlp
-  writeFileSync(YT_COOKIES_PATH, content, "utf-8");
+  // Write canonical copy to disk with strict permissions
+  writeFileSync(YT_COOKIES_PATH, content, { encoding: "utf-8", mode: 0o600 });
 
-  res.json({ ok: true });
+  res.json({ ok: true, validation });
 });
 
 // DELETE /api/settings/yt-cookies — remove cookies
-router.delete("/settings/yt-cookies", async (_req, res): Promise<void> => {
+router.delete("/settings/yt-cookies", requireSettingsAuth, async (_req, res): Promise<void> => {
   await db.delete(appConfigTable).where(eq(appConfigTable.key, YT_COOKIES_DB_KEY));
   try { if (existsSync(YT_COOKIES_PATH)) unlinkSync(YT_COOKIES_PATH); } catch { /* noop */ }
   res.sendStatus(204);
+});
+
+// ── Optional Download Proxy ──────────────────────────────────────────────────
+
+// GET /api/settings/yt-proxy — returns masked host summary only (never credentials)
+router.get("/settings/yt-proxy", requireSettingsAuth, async (_req, res): Promise<void> => {
+  const status = await getMaskedProxyStatus();
+  res.json(status);
+});
+
+// POST /api/settings/yt-proxy — validate SSRF-safely & save proxy URL
+router.post("/settings/yt-proxy", requireSettingsAuth, async (req, res): Promise<void> => {
+  const body = req.body as { proxyUrl?: string };
+  const check = validateAndNormalizeProxyUrl(body?.proxyUrl ?? "");
+  if (!check.ok) {
+    res.status(400).json({ error: check.error });
+    return;
+  }
+
+  await db
+    .insert(appConfigTable)
+    .values({ key: YT_PROXY_DB_KEY, value: check.normalized })
+    .onConflictDoUpdate({
+      target: appConfigTable.key,
+      set: { value: check.normalized, updatedAt: new Date() },
+    });
+
+  res.json({ ok: true, set: true, maskedHost: check.masked });
+});
+
+// DELETE /api/settings/yt-proxy — remove saved proxy
+router.delete("/settings/yt-proxy", requireSettingsAuth, async (_req, res): Promise<void> => {
+  await db.delete(appConfigTable).where(eq(appConfigTable.key, YT_PROXY_DB_KEY));
+  res.sendStatus(204);
+});
+
+// ── YouTube / yt-dlp Diagnostics Probe ───────────────────────────────────────
+
+const SAFE_YT_URL_RE =
+  /^https:\/\/(?:www\.|m\.)?(?:youtube\.com\/watch\?v=[a-zA-Z0-9_-]{11}|youtu\.be\/[a-zA-Z0-9_-]{11})(?:[&?].*)?$/;
+
+router.post("/settings/yt-diagnostics/test", requireSettingsAuth, async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as {
+    proxyUrl?: string;
+    testUrl?: string;
+    runLiveProbe?: boolean;
+  };
+
+  let proxyOverride: string | null | undefined = undefined;
+  if (typeof body.proxyUrl === "string" && body.proxyUrl.trim()) {
+    const check = validateAndNormalizeProxyUrl(body.proxyUrl);
+    if (!check.ok) {
+      res.status(400).json({ error: check.error });
+      return;
+    }
+    proxyOverride = check.normalized;
+  }
+
+  let safeTestUrl: string | undefined = undefined;
+  if (typeof body.testUrl === "string" && body.testUrl.trim()) {
+    const trimmedUrl = body.testUrl.trim();
+    if (!SAFE_YT_URL_RE.test(trimmedUrl)) {
+      res.status(400).json({
+        error: "Diagnostic URL must be a valid https://youtube.com/watch?v=... or https://youtu.be/... video URL.",
+      });
+      return;
+    }
+    safeTestUrl = trimmedUrl;
+  }
+
+  const [cookieRow] = await db
+    .select({ value: appConfigTable.value })
+    .from(appConfigTable)
+    .where(eq(appConfigTable.key, YT_COOKIES_DB_KEY))
+    .limit(1);
+
+  const cookieValidation = cookieRow?.value ? validateNetscapeCookies(cookieRow.value) : null;
+  const report = await runYtDlpDiagnostics({
+    testUrl: safeTestUrl,
+    proxyOverride,
+    runLiveProbe: body.runLiveProbe !== false,
+  });
+
+  res.json({
+    ...report,
+    cookies: cookieValidation
+      ? { set: true, validation: cookieValidation }
+      : { set: false, validation: null },
+  });
 });
 
 // ── Watermark Logo ───────────────────────────────────────────────────────────
@@ -173,12 +290,12 @@ router.post("/settings/watermark-logo", async (req, res): Promise<void> => {
     execSync(`magick "${LOGO_TMP_PATH}" -fuzz 22% -transparent black "${LOGO_FILE_PATH}"`, { timeout: 30_000 });
     try { unlinkSync(LOGO_TMP_PATH); } catch { /* noop */ }
     res.json({ ok: true });
-  } catch (err) {
+  } catch {
     // Fallback: save raw bytes directly (no background removal)
     try {
       writeFileSync(LOGO_FILE_PATH, buf);
       res.json({ ok: true, warn: "Background removal failed — logo saved as-is" });
-    } catch (e2) {
+    } catch {
       res.status(500).json({ error: "Failed to save logo file" });
     }
   }

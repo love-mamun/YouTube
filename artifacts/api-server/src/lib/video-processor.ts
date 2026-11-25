@@ -8,6 +8,11 @@ import { db, videoJobsTable, thumbnailsTable, publishLogsTable, apiTokensTable, 
 import { publishToYouTube, updatePublishLog } from "./youtube-publisher";
 import { publishToFacebook } from "./facebook-publisher";
 import { logger } from "./logger";
+import {
+  fetchYtDlpMetadataShared,
+  downloadVideoWithResilience,
+  type YtDlpMeta,
+} from "./ytdlp-downloader";
 
 const execAsync = promisify(exec);
 
@@ -37,19 +42,6 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface YtDlpMeta {
-  title?: string;
-  description?: string;
-  tags?: string[];
-  duration?: number;
-  thumbnail?: string;
-  uploader?: string;
-  view_count?: number;
-  id?: string;
-  extractor?: string;
-  webpage_url?: string;
-}
-
 function detectPlatform(url: string): "youtube" | "facebook" | "other" {
   if (/youtube\.com|youtu\.be/i.test(url)) return "youtube";
   if (/facebook\.com|fb\.watch|fb\.com/i.test(url)) return "facebook";
@@ -64,48 +56,7 @@ function extractYouTubeId(url: string): string | null {
 }
 
 async function fetchYtDlpMetadata(url: string): Promise<YtDlpMeta> {
-  return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    const hasCookies = existsSync(YT_COOKIES_PATH);
-    const cookieArgs = hasCookies ? ["--cookies", YT_COOKIES_PATH] : [];
-    // android_vr first — bypasses PO token & SABR for public videos.
-    // Fall back to web client with cookies/UA if cookies are present.
-    const clientArgs = [
-      "--extractor-args", "youtube:player_client=android_vr;formats=missing_pot",
-    ];
-    const proc = spawn("python3", [
-      "-m", "yt_dlp",
-      "--dump-json",
-      "--no-playlist",
-      "--skip-download",
-      "--ignore-no-formats-error",
-      ...JS_RUNTIME_ARGS,
-      ...bgutilArgs(),
-      ...clientArgs,
-      ...cookieArgs,
-      url,
-    ], { env: YTDLP_ENV, timeout: 30_000 });
-    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    proc.on("close", (code) => {
-      const raw = stdout.trim();
-      if (raw) {
-        try {
-          resolve(JSON.parse(raw) as YtDlpMeta);
-          return;
-        } catch {
-          // fall through
-        }
-      }
-      logger.warn({ code, stderr: stderr.slice(0, 300) }, "yt-dlp metadata fetch failed");
-      resolve({});
-    });
-    proc.on("error", (err) => {
-      logger.warn({ err }, "yt-dlp spawn error");
-      resolve({});
-    });
-  });
+  return fetchYtDlpMetadataShared(url);
 }
 
 async function fetchYouTubeOembedFallback(url: string): Promise<YtDlpMeta> {
@@ -159,99 +110,6 @@ async function verifyFfmpeg(): Promise<boolean> {
   }
 }
 
-const YT_COOKIES_PATH = "/tmp/n3xus-yt-cookies.txt";
-
-// ── yt-dlp via PYTHONPATH (pip 2026.06.09, far newer than Nix 2025.06.30) ──
-// The Nix yt-dlp (2025.06.30) is broken for YouTube: nsig extraction fails and
-// YouTube forced SABR streaming which the old version can't handle.
-// yt-dlp 2026.06.09 uses the android_vr client which bypasses SABR entirely and
-// can list/download all resolutions from 480p up to 4K without needing a JS
-// runtime or PO Token. PYTHONPATH override makes python3 load this version.
-const YTDLP_PYTHONPATH = "/home/runner/workspace/.pythonlibs/lib/python3.12/site-packages";
-const YTDLP_ENV = existsSync(YTDLP_PYTHONPATH)
-  ? { ...process.env, PYTHONPATH: YTDLP_PYTHONPATH }
-  : { ...process.env };
-
-const NODE_BIN = process.execPath ?? "node";
-const JS_RUNTIME_ARGS = ["--js-runtimes", `node:${NODE_BIN}`];
-
-const BGUTIL_SERVER_HOME = path.resolve(process.cwd(), "bgutil-ytdlp-pot-provider/server");
-const BGUTIL_SCRIPT = `${BGUTIL_SERVER_HOME}/build/generate_once.js`;
-
-// Returns extractor-args to activate bgutil PO token if the script is built.
-function bgutilArgs(): string[] {
-  if (existsSync(BGUTIL_SCRIPT)) {
-    return ["--extractor-args", `youtubepot-bgutilscript:server_home=${BGUTIL_SERVER_HOME}`];
-  }
-  return [];
-}
-
-// Strategy order:
-//  Phase 0 — android_vr WITHOUT cookies (fastest, no PO token needed, works for ~95% of public videos)
-//  Phase 1 — cookie-based strategies (if cookies are present and Phase 0 failed)
-//  Phase 2 — web client with bgutil PO token (if script built)
-//  Phase 3 — bare fallback
-
-// android_vr is always first — it bypasses SABR & PO token for most public videos.
-const STRATEGIES_WITH_COOKIES: Array<{ client: string }> = [
-  { client: "android_vr"   },  // no PO token needed
-  { client: "web"          },
-  { client: "mweb"         },
-  { client: "tv_embedded"  },
-];
-const STRATEGIES_NO_COOKIES: Array<{ client: string }> = [
-  { client: "android_vr"   },  // primary — bypasses SABR and PO token
-  { client: "web"          },
-  { client: "mweb"         },
-  { client: "tv_embedded"  },
-];
-
-// Chrome user-agent to pair with browser cookies (web client expects this)
-const CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-
-function spawnYtDlp(
-  args: string[],
-  onProgress?: (pct: number) => void,
-  timeoutMs = 600_000
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let stderr = "";
-    let timedOut = false;
-    // Use new yt-dlp (2026.06.09) via PYTHONPATH override + Node.js JS runtime
-    const proc = spawn("python3", ["-m", "yt_dlp", ...args], { env: YTDLP_ENV });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      proc.kill("SIGKILL");
-      reject(new Error("yt-dlp timed out"));
-    }, timeoutMs);
-
-    proc.stdout.on("data", (chunk: Buffer) => {
-      const line = chunk.toString();
-      const m = line.match(/(\d+\.\d+)%/);
-      if (m && onProgress) onProgress(parseFloat(m[1]));
-    });
-    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) return;
-      if (code === 0) { resolve(); return; }
-      reject(new Error(stderr.slice(-500)));
-    });
-    proc.on("error", (err) => { clearTimeout(timer); reject(err); });
-  });
-}
-
-/** Download video with yt-dlp at the specified quality and merge to mp4.
- *
- *  Strategy rotation:
- *   1. Each player client is tried with formats=missing_pot so yt-dlp does not
- *      skip streams that lack a Proof-Of-Origin Token.
- *   2. For each client we try a quality-constrained format first, then fall back
- *      to "best" (any format yt-dlp can grab) so the video is never blocked
- *      solely by format-selector strictness.
- *   3. A final bare "best" attempt without any client override catches edge cases.
- */
 async function downloadVideo(
   url: string,
   quality: string,
@@ -259,98 +117,14 @@ async function downloadVideo(
   onProgress?: (pct: number) => void,
   codec?: string | null
 ): Promise<void> {
-  const heightMap: Record<string, number> = {
-    "360p": 360, "480p": 480, "720p": 720,
-    "1080p": 1080, "1440p": 1440, "4k": 2160,
-  };
-  const maxH = heightMap[quality] ?? 1080;
-
-  // Build codec filter: yt-dlp vcodec values
-  // av1 → av01, vp9 → vp9, h264 → avc1
-  const vcodecMap: Record<string, string> = {
-    av1:  "av01",
-    vp9:  "vp9",
-    h264: "avc1",
-  };
-  const vcodecFilter = codec && vcodecMap[codec]
-    ? `[vcodec^=${vcodecMap[codec]}]`
-    : "";
-
-  // Two format selectors per client:
-  // 1. Strict: prefer exact height + codec, fall back within-height only
-  // 2. Relaxed: still prefers target height + codec but allows any if truly unavailable
-  const constrainedFmt = vcodecFilter
-    ? `bestvideo*[height<=${maxH}]${vcodecFilter}+bestaudio/bestvideo*[height<=${maxH}]+bestaudio/best[height<=${maxH}]`
-    : `bestvideo*[height<=${maxH}][height>=${maxH}]+bestaudio/bestvideo*[height<=${maxH}]+bestaudio/best[height<=${maxH}]`;
-  const bestFmt = vcodecFilter
-    ? `bestvideo*[height<=${maxH}]${vcodecFilter}+bestaudio/bestvideo*[height<=${maxH}]+bestaudio/best[height<=${maxH}]/best`
-    : `bestvideo*[height<=${maxH}]+bestaudio/bestvideo*+bestaudio/best[height<=${maxH}]/best`;
-
-  const commonArgs = [
-    "--merge-output-format", "mp4",
-    "--no-playlist",
-    "--no-check-formats",
-    "--progress",
-    ...JS_RUNTIME_ARGS,
-    "-o", outputPath,
-  ];
-
-  const hasCookies = existsSync(YT_COOKIES_PATH);
-  const cookieArgs = hasCookies ? ["--cookies", YT_COOKIES_PATH] : [];
-  // UA only for web/mweb — android_vr doesn't need it
-  const uaArgs = hasCookies ? ["--user-agent", CHROME_UA] : [];
-  const clientStrategies = hasCookies ? STRATEGIES_WITH_COOKIES : STRATEGIES_NO_COOKIES;
-  const potArgs = bgutilArgs(); // PO token via bgutil script (empty if not built)
-
-  let lastError = "";
-
-  // Phase 1 — android_vr first (no cookies, no PO token needed for public videos),
-  //            then web/mweb/tv_embedded with cookies + bgutil PO token if available.
-  for (const { client } of clientStrategies) {
-    const isAndroidVr = client === "android_vr";
-    // android_vr doesn't use cookies or UA; other clients do
-    const thisCookieArgs = isAndroidVr ? [] : cookieArgs;
-    const thisUaArgs    = isAndroidVr ? [] : uaArgs;
-    // bgutil PO token only helps web clients
-    const thisPotArgs   = isAndroidVr ? [] : potArgs;
-
-    for (const fmt of [constrainedFmt, bestFmt]) {
-      logger.info({ url, client, fmt: fmt.slice(0, 40), hasCookies, bgutil: thisPotArgs.length > 0 }, "Trying client strategy");
-      try {
-        await spawnYtDlp([
-          "-f", fmt,
-          "--extractor-args", `youtube:player_client=${client};formats=missing_pot`,
-          ...thisUaArgs,
-          ...thisPotArgs,
-          ...commonArgs,
-          ...thisCookieArgs,
-          url,
-        ], onProgress, 240_000);
-        logger.info({ url, client }, "Download succeeded");
-        return;
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
-        logger.warn({ url, client, err: lastError.slice(0, 120) }, "Client strategy failed");
-      }
-    }
-  }
-
-  // Phase 2 — last resort: bare best, no client override, no cookies
-  logger.warn({ url }, "All strategies failed — trying bare fallback");
-  try {
-    await spawnYtDlp([
-      "-f", bestFmt,
-      "--extractor-args", "youtube:formats=missing_pot",
-      ...commonArgs,
-      url,
-    ], onProgress, 180_000);
-    logger.info({ url }, "Bare fallback succeeded");
-    return;
-  } catch (err) {
-    lastError = err instanceof Error ? err.message : String(err);
-  }
-
-  throw new Error(`yt-dlp download failed after all strategies: ${lastError.slice(0, 300)}`);
+  await downloadVideoWithResilience({
+    url,
+    quality,
+    outputPath,
+    onProgress,
+    codec,
+    jobTag: path.basename(outputPath, ".mp4"),
+  });
 }
 
 /**

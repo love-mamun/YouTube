@@ -19,8 +19,9 @@ import { useState, useEffect, useRef } from "react";
 import {
   Play, CheckCircle2, Send, Loader2, ArrowLeft, Youtube,
   Facebook, AlertTriangle, Copy, Check, Eye, EyeOff,
-  ThumbsUp, Upload, ExternalLink,
+  ThumbsUp, Upload, ExternalLink, Settings as SettingsIcon,
 } from "lucide-react";
+import { parseJobErrorDiagnostic } from "@/lib/ytdlp-errors";
 
 const ACTIVE_STATUSES = ["pending", "downloading", "processing", "generating", "publishing"];
 
@@ -292,12 +293,37 @@ export default function JobDetail() {
               <span className="text-primary">&#x25B6;</span> {status.currentStep}
             </p>
           )}
-          {job.errorMessage && (
-            <div className="mt-3 flex items-start gap-2 text-xs text-destructive font-mono bg-destructive/10 p-3 rounded">
-              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
-              <span className="break-words">{job.errorMessage}</span>
-            </div>
-          )}
+          {job.errorMessage && (() => {
+            const diag = parseJobErrorDiagnostic(job.errorMessage);
+            return (
+              <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/10 p-3.5 space-y-2.5">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-mono font-semibold text-destructive">
+                    <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                    <span>{diag.title}</span>
+                  </div>
+                  {diag.showSettingsLink && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => navigate("/settings")}
+                      className="h-6 px-2 text-[11px] font-mono gap-1 border-destructive/40 text-foreground hover:bg-destructive/15 shrink-0"
+                    >
+                      <SettingsIcon className="w-3 h-3" /> Open Settings
+                    </Button>
+                  )}
+                </div>
+                <p className="text-xs text-destructive/90 font-mono break-words">{diag.summary}</p>
+                {diag.tips.length > 0 && (
+                  <ul className="space-y-1 text-[11px] text-muted-foreground list-disc list-inside pt-1 border-t border-destructive/20">
+                    {diag.tips.map((tip, idx) => (
+                      <li key={idx}>{tip}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            );
+          })()}
         </Card>
 
         {/* Content + Thumbnails */}

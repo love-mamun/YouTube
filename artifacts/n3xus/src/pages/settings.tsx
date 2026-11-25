@@ -18,9 +18,10 @@ import {
   Youtube, Facebook, Trash2, Loader2, CheckCircle2, ExternalLink,
   AlertTriangle, Users, Key, Save, Eye, EyeOff,
   ChevronDown, ChevronUp, Plus, Star, RefreshCw, Cookie, Info, ImageIcon, Upload,
-  Lock, LogOut, ShieldCheck,
+  Lock, LogOut, ShieldCheck, Globe, Activity,
 } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
+import { previewNetscapeCookiesClient, type CookieValidationSummary } from "@/lib/ytdlp-errors";
 
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 
@@ -187,12 +188,48 @@ export default function Settings() {
   const [oauthError, setOauthError] = useState<string | null>(null);
 
   // YouTube cookies state
-  const [cookiesStatus, setCookiesStatus] = useState<{ set: boolean; updatedAt: string | null }>({ set: false, updatedAt: null });
+  const [cookiesStatus, setCookiesStatus] = useState<{
+    set: boolean;
+    updatedAt: string | null;
+    validation: CookieValidationSummary | null;
+  }>({ set: false, updatedAt: null, validation: null });
   const [cookiesText, setCookiesText] = useState("");
   const [cookiesSaving, setCookiesSaving] = useState(false);
   const [cookiesSavedOk, setCookiesSavedOk] = useState(false);
   const [cookiesError, setCookiesError] = useState<string | null>(null);
   const [showCookiesGuide, setShowCookiesGuide] = useState(false);
+  const cookiesPreview = previewNetscapeCookiesClient(cookiesText);
+
+  // Download proxy state
+  const [proxyStatus, setProxyStatus] = useState<{
+    set: boolean;
+    maskedHost: string | null;
+    updatedAt: string | null;
+  }>({ set: false, maskedHost: null, updatedAt: null });
+  const [proxyInput, setProxyInput] = useState("");
+  const [showProxy, setShowProxy] = useState(false);
+  const [proxySaving, setProxySaving] = useState(false);
+  const [proxySavedOk, setProxySavedOk] = useState(false);
+  const [proxyError, setProxyError] = useState<string | null>(null);
+
+  // Diagnostics probe state
+  const [diagRunning, setDiagRunning] = useState(false);
+  const [diagError, setDiagError] = useState<string | null>(null);
+  const [diagResult, setDiagResult] = useState<{
+    ytDlp: { ok: boolean; version: string | null; error: string | null };
+    potServer: { ok: boolean; mode: string; endpoint: string | null };
+    proxy: { configured: boolean; maskedHost: string | null; ok: boolean | null; error: string | null };
+    cookies: { set: boolean; validation: CookieValidationSummary | null };
+    probe: {
+      attempted: boolean;
+      ok: boolean | null;
+      maxHeight: number | null;
+      has4k: boolean | null;
+      clientUsed: string | null;
+      errorCode: string | null;
+      message: string | null;
+    };
+  } | null>(null);
 
   // Watermark logo state
   const [logoSet, setLogoSet] = useState(false);
@@ -274,8 +311,27 @@ export default function Settings() {
 
   const fetchCookiesStatus = async () => {
     try {
-      const res = await fetch(`${BASE}/api/settings/yt-cookies`);
-      if (res.ok) setCookiesStatus((await res.json()) as { set: boolean; updatedAt: string | null });
+      const res = await fetch(`${BASE}/api/settings/yt-cookies`, { credentials: "include" });
+      if (res.ok) {
+        setCookiesStatus(
+          (await res.json()) as {
+            set: boolean;
+            updatedAt: string | null;
+            validation: CookieValidationSummary | null;
+          }
+        );
+      }
+    } catch { /* ignore */ }
+  };
+
+  const fetchProxyStatus = async () => {
+    try {
+      const res = await fetch(`${BASE}/api/settings/yt-proxy`, { credentials: "include" });
+      if (res.ok) {
+        setProxyStatus(
+          (await res.json()) as { set: boolean; maskedHost: string | null; updatedAt: string | null }
+        );
+      }
     } catch { /* ignore */ }
   };
 
@@ -318,14 +374,16 @@ export default function Settings() {
 
   const handleSaveCookies = async () => {
     if (!cookiesText.trim()) return;
-    setCookiesSaving(true); setCookiesError(null);
+    setCookiesSaving(true); setCookiesError(null); setCookiesSavedOk(false);
     try {
       const res = await fetch(`${BASE}/api/settings/yt-cookies`, {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ cookies: cookiesText }),
       });
-      if (!res.ok) { setCookiesError(`Server error ${res.status}`); return; }
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) { setCookiesError(data.error ?? `Server error ${res.status}`); return; }
       setCookiesText("");
       setCookiesSavedOk(true);
       setTimeout(() => setCookiesSavedOk(false), 4000);
@@ -335,10 +393,69 @@ export default function Settings() {
 
   const handleDeleteCookies = async () => {
     try {
-      await fetch(`${BASE}/api/settings/yt-cookies`, { method: "DELETE" });
+      await fetch(`${BASE}/api/settings/yt-cookies`, { method: "DELETE", credentials: "include" });
       await fetchCookiesStatus();
     } catch { /* ignore */ }
   };
+
+  const handleSaveProxy = async () => {
+    if (!proxyInput.trim()) return;
+    setProxySaving(true); setProxyError(null); setProxySavedOk(false);
+    try {
+      const res = await fetch(`${BASE}/api/settings/yt-proxy`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proxyUrl: proxyInput }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) { setProxyError(data.error ?? `Server error ${res.status}`); return; }
+      setProxyInput("");
+      setProxySavedOk(true);
+      setTimeout(() => setProxySavedOk(false), 4000);
+      await fetchProxyStatus();
+    } catch { setProxyError("Network error."); } finally { setProxySaving(false); }
+  };
+
+  const handleDeleteProxy = async () => {
+    setProxyError(null);
+    try {
+      await fetch(`${BASE}/api/settings/yt-proxy`, { method: "DELETE", credentials: "include" });
+      await fetchProxyStatus();
+    } catch { /* ignore */ }
+  };
+
+  const handleRunDiagnostics = async (overrideProxy?: string) => {
+    setDiagRunning(true); setDiagError(null);
+    try {
+      const res = await fetch(`${BASE}/api/settings/yt-diagnostics/test`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          proxyUrl: overrideProxy?.trim() || undefined,
+          runLiveProbe: true,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setDiagError((data as { error?: string }).error ?? `Diagnostic check failed (${res.status})`);
+        return;
+      }
+      setDiagResult(data);
+    } catch {
+      setDiagError("Network error running diagnostics.");
+    } finally {
+      setDiagRunning(false);
+    }
+  };
+
+  useEffect(() => {
+    if (authed) {
+      fetchProxyStatus();
+      fetchCookiesStatus();
+    }
+  }, [authed]);
 
   useEffect(() => {
     fetchYtChannels();
@@ -704,32 +821,67 @@ export default function Settings() {
               <Cookie className="w-4 h-4 text-amber-400" />
             </div>
             <div className="flex-1 min-w-0">
-              <h2 className="text-sm font-display font-semibold text-foreground flex items-center gap-2">
+              <h2 className="text-sm font-display font-semibold text-foreground flex items-center gap-2 flex-wrap">
                 YouTube Download Cookies
                 <Badge className="text-[10px] font-mono bg-amber-500/10 text-amber-400 border-amber-500/20">Required for 4K Mission</Badge>
               </h2>
-              <p className="text-xs text-muted-foreground">YouTube blocks server-side downloads without real browser cookies.</p>
+              <p className="text-xs text-muted-foreground">Used with the built-in PO Token server to clear YouTube bot verification.</p>
             </div>
-            {cookiesStatus.set && (
-              <span className="text-[10px] font-mono text-green-400 flex items-center gap-1 shrink-0">
-                <CheckCircle2 className="w-3 h-3" /> Active
-              </span>
-            )}
+            {cookiesStatus.set && (() => {
+              const st = cookiesStatus.validation?.status;
+              const isHealthy = st === "valid" || !st;
+              const isWarn = st === "expiring_soon";
+              return (
+                <span className={`text-[10px] font-mono flex items-center gap-1 shrink-0 ${
+                  isHealthy ? "text-green-400" : isWarn ? "text-amber-400" : "text-destructive"
+                }`}>
+                  {isHealthy ? <CheckCircle2 className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
+                  {st === "valid" ? "Valid" : st === "expiring_soon" ? "Expiring Soon" : st === "expired" ? "Expired" : st === "missing_auth" ? "Missing Auth" : "Active"}
+                </span>
+              );
+            })()}
           </div>
 
           {cookiesStatus.set && (
-            <div className="flex items-center justify-between p-3 rounded-md bg-green-500/5 border border-green-500/20">
-              <div className="flex items-center gap-2 text-xs font-mono text-green-400">
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                Cookie file saved
-                {cookiesStatus.updatedAt && (
-                  <span className="text-muted-foreground">· {new Date(cookiesStatus.updatedAt).toLocaleDateString()}</span>
-                )}
+            <div className={`p-3 rounded-md border space-y-1.5 ${
+              cookiesStatus.validation?.status === "expired" || cookiesStatus.validation?.status === "missing_auth"
+                ? "bg-destructive/10 border-destructive/30"
+                : cookiesStatus.validation?.status === "expiring_soon"
+                ? "bg-amber-500/10 border-amber-500/30"
+                : "bg-green-500/5 border-green-500/20"
+            }`}>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-mono text-foreground flex-wrap">
+                  {cookiesStatus.validation?.valid !== false ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+                  ) : (
+                    <AlertTriangle className="w-3.5 h-3.5 text-destructive shrink-0" />
+                  )}
+                  <span>
+                    {cookiesStatus.validation
+                      ? `${cookiesStatus.validation.ytCookieCount} YouTube/Google cookies (${cookiesStatus.validation.foundAuthCookies.length} auth keys)`
+                      : "Cookie file saved"}
+                  </span>
+                  {cookiesStatus.updatedAt && (
+                    <span className="text-muted-foreground">· {new Date(cookiesStatus.updatedAt).toLocaleDateString()}</span>
+                  )}
+                </div>
+                <Button size="sm" variant="ghost" onClick={handleDeleteCookies}
+                  className="text-xs font-mono gap-1 h-6 text-destructive hover:text-destructive px-2 shrink-0">
+                  <Trash2 className="w-3 h-3" /> Remove
+                </Button>
               </div>
-              <Button size="sm" variant="ghost" onClick={handleDeleteCookies}
-                className="text-xs font-mono gap-1 h-6 text-destructive hover:text-destructive px-2">
-                <Trash2 className="w-3 h-3" /> Remove
-              </Button>
+              {cookiesStatus.validation?.earliestExpiry && (
+                <p className="text-[11px] font-mono text-muted-foreground">
+                  Earliest auth expiry: {new Date(cookiesStatus.validation.earliestExpiry).toLocaleDateString()}
+                  {cookiesStatus.validation.foundAuthCookies.length > 0 && (
+                    <> · Keys: {cookiesStatus.validation.foundAuthCookies.slice(0, 5).join(", ")}</>
+                  )}
+                </p>
+              )}
+              {cookiesStatus.validation?.warnings.map((w, idx) => (
+                <p key={idx} className="text-[11px] font-mono text-amber-400">{w}</p>
+              ))}
             </div>
           )}
 
@@ -742,6 +894,21 @@ export default function Settings() {
               className="font-mono text-xs bg-muted/40 border-border/70 focus:border-amber-500/50 min-h-[100px] resize-y"
               rows={4}
             />
+            {cookiesPreview && (
+              <div className={`text-[11px] font-mono px-2.5 py-2 rounded border ${
+                cookiesPreview.valid
+                  ? "bg-green-500/10 border-green-500/20 text-green-400"
+                  : "bg-destructive/10 border-destructive/20 text-destructive"
+              }`}>
+                {cookiesPreview.valid ? (
+                  <span>
+                    Preview OK: {cookiesPreview.cookieCount} rows ({cookiesPreview.ytCookieCount} YouTube/Google · auth keys: {cookiesPreview.foundAuthCookies.join(", ")})
+                  </span>
+                ) : (
+                  <span>{cookiesPreview.warnings[0] ?? "Invalid Netscape cookie text."}</span>
+                )}
+              </div>
+            )}
           </div>
 
           {cookiesError && (
@@ -751,16 +918,78 @@ export default function Settings() {
           )}
           {cookiesSavedOk && (
             <div className="flex items-center gap-2 text-xs text-green-400 font-mono bg-green-500/10 border border-green-500/20 rounded-md p-2.5">
-              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />Cookies saved — 4K Mission downloads will now use them.
+              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />Cookies validated & saved — downloads will now use them.
             </div>
           )}
 
-          <Button onClick={handleSaveCookies} disabled={!cookiesText.trim() || cookiesSaving}
-            className="w-full font-mono text-xs gap-2 bg-amber-500/80 hover:bg-amber-500 text-black">
-            {cookiesSaving ? <Loader2 className="w-4 h-4 animate-spin" /> :
-             cookiesSavedOk ? <CheckCircle2 className="w-4 h-4" /> : <Save className="w-4 h-4" />}
-            {cookiesSavedOk ? "Cookies saved!" : cookiesSaving ? "Saving…" : "Save Cookies"}
-          </Button>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <Button onClick={handleSaveCookies} disabled={!cookiesText.trim() || cookiesSaving}
+              className="flex-1 font-mono text-xs gap-2 bg-amber-500/80 hover:bg-amber-500 text-black">
+              {cookiesSaving ? <Loader2 className="w-4 h-4 animate-spin" /> :
+               cookiesSavedOk ? <CheckCircle2 className="w-4 h-4" /> : <Save className="w-4 h-4" />}
+              {cookiesSavedOk ? "Cookies saved!" : cookiesSaving ? "Validating & Saving…" : "Save Cookies"}
+            </Button>
+            <Button type="button" variant="outline" onClick={() => handleRunDiagnostics()} disabled={diagRunning}
+              className="font-mono text-xs gap-2">
+              {diagRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Activity className="w-3.5 h-3.5" />}
+              {diagRunning ? "Testing…" : "Test Download Setup"}
+            </Button>
+          </div>
+
+          {diagError && (
+            <div className="flex items-center gap-2 text-xs text-destructive font-mono bg-destructive/10 border border-destructive/20 rounded-md p-2.5">
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />{diagError}
+            </div>
+          )}
+
+          {diagResult && (
+            <div className="rounded-lg border border-border/60 bg-muted/30 p-3 space-y-2 text-xs font-mono">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div className="flex items-center justify-between bg-background/50 px-2.5 py-1.5 rounded border border-border/40">
+                  <span className="text-muted-foreground">yt-dlp</span>
+                  <span className={diagResult.ytDlp.ok ? "text-green-400" : "text-destructive"}>
+                    {diagResult.ytDlp.ok ? diagResult.ytDlp.version : "Missing"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between bg-background/50 px-2.5 py-1.5 rounded border border-border/40">
+                  <span className="text-muted-foreground">PO Token Server</span>
+                  <span className={diagResult.potServer.ok ? "text-green-400" : "text-amber-400"}>
+                    {diagResult.potServer.ok ? `Active (${diagResult.potServer.mode})` : "Not running"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between bg-background/50 px-2.5 py-1.5 rounded border border-border/40">
+                  <span className="text-muted-foreground">Cookies</span>
+                  <span className={diagResult.cookies.validation?.valid ? "text-green-400" : "text-amber-400"}>
+                    {diagResult.cookies.set ? diagResult.cookies.validation?.status ?? "Saved" : "None"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between bg-background/50 px-2.5 py-1.5 rounded border border-border/40">
+                  <span className="text-muted-foreground">Proxy</span>
+                  <span className={
+                    !diagResult.proxy.configured
+                      ? "text-muted-foreground"
+                      : diagResult.proxy.ok
+                      ? "text-green-400"
+                      : "text-destructive"
+                  }>
+                    {!diagResult.proxy.configured ? "Direct IP" : diagResult.proxy.ok ? "Reachable" : "Unreachable"}
+                  </span>
+                </div>
+              </div>
+              {diagResult.proxy.error && (
+                <p className="text-[11px] text-destructive">Proxy error: {diagResult.proxy.error}</p>
+              )}
+              {diagResult.probe.attempted && diagResult.probe.message && (
+                <div className={`p-2 rounded border text-[11px] ${
+                  diagResult.probe.ok
+                    ? "bg-green-500/10 border-green-500/20 text-green-400"
+                    : "bg-destructive/10 border-destructive/20 text-destructive"
+                }`}>
+                  {diagResult.probe.message}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* How-to guide */}
           <div>
@@ -786,6 +1015,88 @@ export default function Settings() {
                 </motion.ol>
               )}
             </AnimatePresence>
+          </div>
+        </Card>
+
+        {/* ── Optional Download Proxy ─────────────────────────────────────── */}
+        <Card className="p-4 sm:p-6 border-border bg-card/80 backdrop-blur-sm space-y-4">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-lg bg-cyan-500/10 flex items-center justify-center shrink-0">
+              <Globe className="w-4 h-4 text-cyan-400" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <h2 className="text-sm font-display font-semibold text-foreground flex items-center gap-2 flex-wrap">
+                Download Proxy
+                <Badge className="text-[10px] font-mono bg-cyan-500/10 text-cyan-400 border-cyan-500/20">Optional · Anti-429</Badge>
+              </h2>
+              <p className="text-xs text-muted-foreground">Route yt-dlp traffic through a residential HTTP or SOCKS5 proxy to bypass shared-IP 429 limits.</p>
+            </div>
+            {proxyStatus.set && (
+              <span className="text-[10px] font-mono text-green-400 flex items-center gap-1 shrink-0">
+                <CheckCircle2 className="w-3 h-3" /> Configured
+              </span>
+            )}
+          </div>
+
+          {proxyStatus.set && (
+            <div className="flex items-center justify-between p-3 rounded-md bg-cyan-500/5 border border-cyan-500/20 gap-2">
+              <div className="text-xs font-mono text-foreground truncate">
+                Active proxy: <span className="text-cyan-400">{proxyStatus.maskedHost}</span>
+              </div>
+              <Button size="sm" variant="ghost" onClick={handleDeleteProxy}
+                className="text-xs font-mono gap-1 h-6 text-destructive hover:text-destructive px-2 shrink-0">
+                <Trash2 className="w-3 h-3" /> Remove
+              </Button>
+            </div>
+          )}
+
+          <div className="space-y-1.5">
+            <Label className="text-xs font-mono text-muted-foreground">
+              Proxy URL (http://user:pass@host:port or socks5://user:pass@host:port)
+            </Label>
+            <div className="relative">
+              <Input
+                type={showProxy ? "text" : "password"}
+                placeholder={proxyStatus.set ? "•••••••••••••••• (enter new proxy URL to replace)" : "http://user:pass@proxy-host:8080"}
+                value={proxyInput}
+                onChange={(e) => setProxyInput(e.target.value)}
+                className="font-mono text-xs pr-8 bg-muted/40 border-border/70 focus:border-cyan-500/50"
+              />
+              <button
+                type="button"
+                onClick={() => setShowProxy((s) => !s)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+              >
+                {showProxy ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+              </button>
+            </div>
+          </div>
+
+          {proxyError && (
+            <div className="flex items-center gap-2 text-xs text-destructive font-mono bg-destructive/10 border border-destructive/20 rounded-md p-2.5">
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />{proxyError}
+            </div>
+          )}
+          {proxySavedOk && (
+            <div className="flex items-center gap-2 text-xs text-green-400 font-mono bg-green-500/10 border border-green-500/20 rounded-md p-2.5">
+              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />Download proxy saved securely.
+            </div>
+          )}
+
+          <div className="flex flex-col sm:flex-row gap-2">
+            <Button onClick={handleSaveProxy} disabled={!proxyInput.trim() || proxySaving}
+              className="flex-1 font-mono text-xs gap-2">
+              {proxySaving ? <Loader2 className="w-4 h-4 animate-spin" /> :
+               proxySavedOk ? <CheckCircle2 className="w-4 h-4 text-green-400" /> : <Save className="w-4 h-4" />}
+              {proxySavedOk ? "Proxy saved!" : proxySaving ? "Saving…" : "Save Proxy"}
+            </Button>
+            <Button type="button" variant="outline"
+              onClick={() => handleRunDiagnostics(proxyInput || undefined)}
+              disabled={diagRunning || (!proxyInput.trim() && !proxyStatus.set)}
+              className="font-mono text-xs gap-2">
+              {diagRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Activity className="w-3.5 h-3.5" />}
+              Test Connection
+            </Button>
           </div>
         </Card>
 
