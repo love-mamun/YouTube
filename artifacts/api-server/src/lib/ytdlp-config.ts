@@ -66,7 +66,10 @@ export const YTDLP_ENV = existsSync(YTDLP_PYTHONPATH)
   : BASE_YTDLP_ENV;
 
 export const NODE_BIN = process.execPath ?? "node";
-export const JS_RUNTIME_ARGS = ["--js-runtimes", `node:${NODE_BIN}`];
+export const JS_RUNTIME_ARGS = [
+  "--js-runtimes", `node:${NODE_BIN}`,
+  "--remote-components", "ejs:github",
+];
 export const CHROME_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -550,9 +553,12 @@ export function classifyYtDlpError(
 
   if (/Sign in to confirm you.?re not a bot|cookies are no longer valid|confirm you are not a bot|do-i-pass-cookies-to-yt-dlp|exporting-youtube-cookies/i.test(msg)) {
     if (context?.usedCookies) {
+      const proxyNote = context.usedProxy
+        ? ` Note: your configured proxy${context.proxyMaskedHost ? ` (${context.proxyMaskedHost})` : ""} may also be flagged by YouTube — try removing or changing the proxy in Settings if fresh cookies still fail.`
+        : " Consider adding a clean residential proxy in Settings if the server IP is flagged.";
       return {
         code: "COOKIES_EXPIRED",
-        formattedMessage: `[COOKIES_EXPIRED] YouTube triggered a bot check even with saved cookies (session may be expired or flagged on this IP). Re-export fresh Netscape cookies from a signed-in browser in Settings, and consider adding a proxy. (${msg.slice(-220)})`,
+        formattedMessage: `[COOKIES_EXPIRED] YouTube triggered a bot check even with saved cookies (session may be expired or flagged on this IP). Re-export fresh Netscape cookies from a signed-in browser in Settings.${proxyNote} (${msg.slice(-220)})`,
       };
     }
     return {
@@ -561,16 +567,26 @@ export function classifyYtDlpError(
     };
   }
 
-  if (/Requested format is not available|Only images are available for download/i.test(msg)) {
+  if (/n challenge solving failed|Signature solving failed|yt-dlp-ejs/i.test(msg)) {
+    return {
+      code: "FORMAT_UNAVAILABLE",
+      formattedMessage: `[FORMAT_UNAVAILABLE] YouTube JS challenge solver (EJS) failed to decode stream URLs. Ensure Node runtime, yt-dlp-ejs, or --remote-components ejs:github can run and redeploy/retry. (${msg.slice(-220)})`,
+    };
+  }
+
+  if (/Requested format is not available|Only images are available for download|No video formats found|SABR-only/i.test(msg)) {
     if (context?.quality === "4k") {
       return {
         code: "4K_UNAVAILABLE",
         formattedMessage: `[4K_UNAVAILABLE] Strict 4K (2160p) stream is not available for this video from the current server IP/session. Verify cookies + PO Token / proxy in Settings or verify the source video has a native 2160p stream. (${msg.slice(-220)})`,
       };
     }
+    const proxyHint = context?.usedProxy
+      ? ` Try removing or changing your proxy${context.proxyMaskedHost ? ` (${context.proxyMaskedHost})` : ""}, or re-exporting cookies.`
+      : " Re-export fresh Netscape cookies in Settings or check PO Token / proxy.";
     return {
       code: "FORMAT_UNAVAILABLE",
-      formattedMessage: `[FORMAT_UNAVAILABLE] Requested video quality (${context?.quality ?? "standard"}) is unavailable on YouTube for this client/session. (${msg.slice(-220)})`,
+      formattedMessage: `[FORMAT_UNAVAILABLE] YouTube returned no playable video formats (${context?.quality ?? "standard"}) for this client/session.${proxyHint} (${msg.slice(-200)})`,
     };
   }
 

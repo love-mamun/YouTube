@@ -331,13 +331,15 @@ function spawnYtDlpRaw(
         resolve({ stdout, stderr });
         return;
       }
-      const errorLines = stderr
-        .split(/\r?\n/)
-        .filter((l) => /^ERROR:/i.test(l.trim()));
-      const conciseErr =
-        errorLines.length > 0
-          ? errorLines.join(" ").slice(-800)
-          : stderr.slice(-800);
+      const lines = stderr.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const errorLines = lines.filter((l) => /^ERROR:/i.test(l));
+      const diagWarnings = lines.filter(
+        (l) =>
+          /^WARNING:/i.test(l) &&
+          /n challenge|Signature solving|SABR|EJS|429|not a bot|timed out|Proxy/i.test(l)
+      );
+      const combined = [...diagWarnings.slice(-2), ...errorLines].join(" ");
+      const conciseErr = combined ? combined.slice(-900) : stderr.slice(-900);
       reject(new Error(conciseErr || `yt-dlp exited with code ${code}`));
     });
 
@@ -475,6 +477,8 @@ export async function downloadVideoWithResilience(options: {
   let botCheckAnonHit = false;
   let formatMiss4KHit = false;
   let last4KFormatError = "";
+  let noFormatsWithCookiesHit = false;
+  let lastNoFormatsError = "";
   let stallHits = 0;
   let proxyTimeoutHits = 0;
 
@@ -629,6 +633,15 @@ export async function downloadVideoWithResilience(options: {
             }
           }
 
+          if (
+            strat.useCookies &&
+            cookieCopy.hasCookies &&
+            /No video formats found|n challenge solving failed|Signature solving failed|SABR-only/i.test(lastError)
+          ) {
+            noFormatsWithCookiesHit = true;
+            lastNoFormatsError = lastError;
+          }
+
           if (/stalled|timed out/i.test(lastError)) {
             stallHits++;
           }
@@ -647,7 +660,9 @@ export async function downloadVideoWithResilience(options: {
         ? `HTTP Error 429: Too Many Requests (${lastError})`
         : formatMiss4KHit && isStrict4K && !botCheckWithCookiesHit
         ? (last4KFormatError || "Requested format is not available for 2160p.")
-        : (botCheckWithCookiesHit || (!formatMiss4KHit && botCheckAnonHit)) &&
+        : noFormatsWithCookiesHit && !botCheckWithCookiesHit
+        ? lastNoFormatsError
+        : (botCheckWithCookiesHit || (!formatMiss4KHit && !noFormatsWithCookiesHit && botCheckAnonHit)) &&
           !/not a bot|do-i-pass-cookies-to-yt-dlp|cookies are no longer valid/i.test(lastError)
         ? `Sign in to confirm you're not a bot (${lastError})`
         : stallHits > 0 && !/stalled|timed out/i.test(lastError)
@@ -656,7 +671,7 @@ export async function downloadVideoWithResilience(options: {
 
     const classified = classifyYtDlpError(prioritizedError, {
       quality,
-      usedCookies: cookieCopy.hasCookies && (!formatMiss4KHit || botCheckWithCookiesHit),
+      usedCookies: cookieCopy.hasCookies && ((!formatMiss4KHit && !noFormatsWithCookiesHit) || botCheckWithCookiesHit),
       usedProxy: Boolean(proxyUrl),
       proxyMaskedHost: maskedProxy,
       potMode: pot.mode,
@@ -762,55 +777,80 @@ export async function runYtDlpDiagnostics(opts: {
   const cookieCopy = await acquireJobCookieCopy("diag");
   try {
     const strategies = buildStrategies(cookieCopy.hasCookies, pot.mode !== "none");
-    const chosen = strategies[0];
-    report.probe.clientUsed = chosen.client;
 
-    const extractorArgs = buildExtractorArgsForStrategy(chosen);
+    const runProbeAttempt = async (strat: ClientStrategy, proxyArg: string | null) => {
+      const extractorArgs = buildExtractorArgsForStrategy(strat);
+      const { stdout } = await spawnYtDlpRaw(
+        [
+          "--dump-single-json",
+          "--simulate",
+          "--no-playlist",
+          "--skip-download",
+          "--socket-timeout", "25",
+          ...JS_RUNTIME_ARGS,
+          ...(strat.usePot ? pot.extractorArgs : []),
+          ...extractorArgs,
+          ...(strat.useCookies && cookieCopy.path
+            ? strat.client === "web"
+              ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
+              : ["--cookies", cookieCopy.path]
+            : []),
+          ...(proxyArg ? ["--proxy", proxyArg] : []),
+          targetUrl,
+        ],
+        { timeoutMs: 40_000, stallTimeoutMs: 35_000 }
+      );
+      const parsed = JSON.parse(stdout) as { formats?: Array<{ width?: number; height?: number; vcodec?: string }> };
+      const heights = (parsed.formats ?? [])
+        .filter((f) => typeof f.height === "number" && f.height > 0 && f.vcodec !== "none")
+        .map((f) => (typeof f.width === "number" && f.width > 0 ? Math.min(f.width, f.height!) : f.height!));
+      return heights.length > 0 ? Math.max(...heights) : null;
+    };
 
-    const { stdout } = await spawnYtDlpRaw(
-      [
-        "--dump-single-json",
-        "--simulate",
-        "--no-playlist",
-        "--skip-download",
-        "--socket-timeout", "25",
-        ...JS_RUNTIME_ARGS,
-        ...(chosen.usePot ? pot.extractorArgs : []),
-        ...extractorArgs,
-        ...(chosen.useCookies && cookieCopy.path
-          ? chosen.client === "web"
-            ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
-            : ["--cookies", cookieCopy.path]
-          : []),
-        ...(effectiveProxy ? ["--proxy", effectiveProxy] : []),
-        targetUrl,
-      ],
-      { timeoutMs: 40_000, stallTimeoutMs: 35_000 }
-    );
+    let lastRawErr = "";
+    let lastClientUsed = strategies[0].client;
 
-    const parsed = JSON.parse(stdout) as { formats?: Array<{ width?: number; height?: number; vcodec?: string }> };
-    const heights = (parsed.formats ?? [])
-      .filter((f) => typeof f.height === "number" && f.height > 0 && f.vcodec !== "none")
-      .map((f) => (typeof f.width === "number" && f.width > 0 ? Math.min(f.width, f.height!) : f.height!));
-    const maxHeight = heights.length > 0 ? Math.max(...heights) : null;
+    for (const chosen of strategies) {
+      lastClientUsed = chosen.client;
+      try {
+        const maxHeight = await runProbeAttempt(chosen, effectiveProxy);
+        report.probe.ok = true;
+        report.probe.clientUsed = chosen.client;
+        report.probe.maxHeight = maxHeight;
+        report.probe.has4k = maxHeight !== null ? maxHeight >= 2160 : false;
+        report.probe.message = maxHeight
+          ? `YouTube stream probe succeeded via ${chosen.client} (max ${maxHeight}p available).`
+          : `YouTube metadata probe succeeded via ${chosen.client}.`;
+        return report;
+      } catch (err) {
+        lastRawErr = err instanceof Error ? err.message : String(err);
+      }
+    }
 
-    report.probe.ok = true;
-    report.probe.maxHeight = maxHeight;
-    report.probe.has4k = maxHeight !== null ? maxHeight >= 2160 : false;
-    report.probe.message = maxHeight
-      ? `YouTube stream probe succeeded via ${chosen.client} (max ${maxHeight}p available).`
-      : `YouTube metadata probe succeeded via ${chosen.client}.`;
-  } catch (err) {
-    const raw = err instanceof Error ? err.message : String(err);
-    const classified = classifyYtDlpError(raw, {
+    // If a proxy was configured and all proxied attempts failed, test direct connection once
+    // so the user knows whether their proxy IP is what broke YouTube format extraction.
+    let directHint = "";
+    if (effectiveProxy) {
+      try {
+        const directMax = await runProbeAttempt(strategies[0], null);
+        if (directMax) {
+          directHint = ` Direct server check (bypassing proxy) succeeded at ${directMax}p — your configured proxy IP may be restricted or returning incomplete streams.`;
+        }
+      } catch {
+        // ignore direct failure
+      }
+    }
+
+    const classified = classifyYtDlpError(lastRawErr || "No playable video formats returned", {
       usedCookies: cookieCopy.hasCookies,
       usedProxy: Boolean(effectiveProxy),
       proxyMaskedHost: maskedEffectiveProxy,
       potMode: pot.mode,
     });
     report.probe.ok = false;
+    report.probe.clientUsed = lastClientUsed;
     report.probe.errorCode = classified.code;
-    report.probe.message = classified.formattedMessage;
+    report.probe.message = `${classified.formattedMessage}${directHint}`;
   } finally {
     cookieCopy.cleanup();
   }

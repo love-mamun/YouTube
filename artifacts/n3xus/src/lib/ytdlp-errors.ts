@@ -207,6 +207,17 @@ export function parseJobErrorDiagnostic(errorMessage: string): ParsedJobDiagnost
         ],
         showSettingsLink: true,
       };
+    case "FORMAT_UNAVAILABLE":
+      return {
+        code,
+        title: "No Playable Video Formats Found",
+        summary: cleanMsg,
+        tips: [
+          "YouTube returned no playable stream URLs for this client/session (common when cookies + proxy trigger SABR-only mode or JS challenge solving is blocked).",
+          "In Settings, run 'Test Download Setup' — if your proxy is active, try temporarily removing the proxy or switching to another IP, and ensure fresh signed-in Netscape cookies are saved.",
+        ],
+        showSettingsLink: true,
+      };
     case "PROXY_ERROR":
       return {
         code,

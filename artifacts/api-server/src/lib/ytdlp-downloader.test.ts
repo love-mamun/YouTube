@@ -24,6 +24,20 @@ test("classifyYtDlpError distinguishes 4K_UNAVAILABLE from BOT_CHECK and COOKIES
     { quality: "1080p", usedCookies: false },
   );
   assert.equal(botWithoutCookies.code, "BOT_CHECK");
+
+  const ejsFail = classifyYtDlpError(
+    "WARNING: [youtube] jNQXAC9IVRw: n challenge solving failed ERROR: [youtube] jNQXAC9IVRw: No video formats found!",
+    { quality: "1080p", usedCookies: true, usedProxy: true, proxyMaskedHost: "http://***@1.2.3.4:8080" },
+  );
+  assert.equal(ejsFail.code, "FORMAT_UNAVAILABLE");
+  assert.match(ejsFail.formattedMessage, /EJS/i);
+
+  const noFormatsProxy = classifyYtDlpError(
+    "ERROR: [youtube] jNQXAC9IVRw: No video formats found!",
+    { usedCookies: true, usedProxy: true, proxyMaskedHost: "http://***@1.2.3.4:8080" },
+  );
+  assert.equal(noFormatsProxy.code, "FORMAT_UNAVAILABLE");
+  assert.match(noFormatsProxy.formattedMessage, /proxy/i);
 });
 
 test("buildDownloadFormatPlan uses res sorting for 360p-1440p so portrait Shorts keep full resolution", () => {
