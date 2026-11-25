@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "license": "MIT",
   "scripts": {
-    "dev": "npm run build --workspace=artifacts/n3xus && tsx artifacts/api-server/src/index.ts",
+    "dev": "sh -c '[ -d artifacts/n3xus/dist/public ] || npm run build --workspace=artifacts/n3xus; PORT=3000 exec tsx artifacts/api-server/src/index.ts'",
     "start": "node --enable-source-maps artifacts/api-server/dist/index.mjs",
     "build": "npm run typecheck:libs && npm run build --workspace=artifacts/n3xus && npm run build --workspace=artifacts/api-server",
     "typecheck:libs": "tsc --build",

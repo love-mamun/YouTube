@@ -79,6 +79,24 @@ app.use(
 
 app.use("/api", router);
 
+app.use(
+  "/api",
+  (
+    err: any,
+    _req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction,
+  ) => {
+    const causeMsg =
+      err?.cause instanceof Error ? err.cause.message : undefined;
+    logger.error({ err, causeMsg }, "Unhandled API route error");
+    if (res.headersSent) return;
+    res.status(err?.status || 500).json({
+      error: causeMsg ? `${err.message}: ${causeMsg}` : (err?.message || "Internal server error"),
+    });
+  },
+);
+
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const assetsDir = existsSync(path.resolve(process.cwd(), "artifacts/api-server/assets"))
   ? path.resolve(process.cwd(), "artifacts/api-server/assets")

@@ -1,4 +1,5 @@
 import app from "./app";
+import { ensureSchema } from "@workspace/db";
 import { logger } from "./lib/logger";
 import { startCleanupScheduler } from "./lib/cleanup-scheduler";
 import { resumeStuckJobs } from "./lib/video-processor";
@@ -11,22 +12,28 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-app.listen(port, "0.0.0.0", (err) => {
-  if (err) {
-    logger.error({ err }, "Error listening on port");
-    process.exit(1);
+async function startServer() {
+  try {
+    await ensureSchema();
+    await seedSettingsPassword().catch((err) =>
+      logger.error({ err }, "seedSettingsPassword failed on startup")
+    );
+  } catch (err) {
+    logger.error({ err }, "ensureSchema failed on startup");
   }
 
-  logger.info({ port }, "Server listening");
-  startCleanupScheduler();
+  app.listen(port, "0.0.0.0", (err) => {
+    if (err) {
+      logger.error({ err }, "Error listening on port");
+      process.exit(1);
+    }
 
-  // Seed settings password from SETTINGS_PASSWORD env var (only if not already in DB)
-  seedSettingsPassword().catch((err) =>
-    logger.error({ err }, "seedSettingsPassword failed on startup")
-  );
+    logger.info({ port }, "Server listening");
+    startCleanupScheduler();
+    resumeStuckJobs().catch((err) =>
+      logger.error({ err }, "resumeStuckJobs failed on startup")
+    );
+  });
+}
 
-  // Resume any jobs that were interrupted by a server restart
-  resumeStuckJobs().catch((err) =>
-    logger.error({ err }, "resumeStuckJobs failed on startup")
-  );
-});
+void startServer();
