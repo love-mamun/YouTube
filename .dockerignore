@@ -1,0 +1,12 @@
+.git
+.github
+.agents
+node_modules
+**/node_modules
+**/dist
+**/.tsbuildinfo
+.video-store
+.pythonlibs
+.env
+.env.*
+*.log
