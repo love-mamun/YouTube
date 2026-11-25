@@ -143,17 +143,33 @@ async function downloadVideo(
 function pidFilePath(jobId: number) { return path.join(getVideoStoreDir(), `job-${jobId}-ffmpeg.pid`); }
 function progressFilePath(jobId: number) { return path.join(getVideoStoreDir(), `job-${jobId}-ffmpeg-progress.txt`); }
 
-async function probeDurationSeconds(filePath: string): Promise<number | null> {
+async function probeMediaInfo(filePath: string): Promise<{ durationSecs: number | null; isPortrait: boolean }> {
   try {
     const { stdout } = await execFileAsync(
       "ffprobe",
-      ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", filePath],
+      [
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:format=duration",
+        "-of", "json",
+        filePath,
+      ],
       { timeout: 10_000 }
     );
-    const secs = parseFloat(stdout.trim());
-    return !Number.isNaN(secs) && secs > 0 ? secs : null;
+    const parsed = JSON.parse(stdout) as {
+      streams?: Array<{ width?: number; height?: number }>;
+      format?: { duration?: string };
+    };
+    const stream = parsed.streams?.[0];
+    const width = stream?.width ?? 0;
+    const height = stream?.height ?? 0;
+    const secs = parsed.format?.duration ? parseFloat(parsed.format.duration) : NaN;
+    return {
+      durationSecs: !Number.isNaN(secs) && secs > 0 ? secs : null,
+      isPortrait: width > 0 && height > 0 && height > width,
+    };
   } catch {
-    return null;
+    return { durationSecs: null, isPortrait: false };
   }
 }
 
@@ -197,10 +213,13 @@ async function processWithFFmpegPipeline(
   durationSecs: number | null,
   onProgress?: (pct: number) => void,
   jobId?: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  isPortrait = false
 ): Promise<void> {
   const res = RESOLUTION_SETTINGS[quality] ?? RESOLUTION_SETTINGS["1080p"];
-  const { scale, bitrate, w: outW } = res;
+  const scale = isPortrait ? `${res.h}:${res.w}` : res.scale;
+  const outW = isPortrait ? res.h : res.w;
+  const { bitrate } = res;
   const is4k = quality === "4k";
   const ffmpegPreset = is4k ? "veryfast" : "medium";
   const threadArgs = is4k ? ["-threads", "2"] : [];
@@ -743,7 +762,8 @@ export async function startVideoProcessing(
 
         const outPath = path.join(storeDir, `job-${jobId}-processed.mp4`);
         const watermark = await getWatermarkText();
-        const durationSecs = meta.duration ?? (await probeDurationSeconds(rawPath));
+        const mediaInfo = await probeMediaInfo(rawPath);
+        const durationSecs = meta.duration ?? mediaInfo.durationSecs;
         let lastFfProgress = 45;
         let lastFfWriteAt = 0;
 
@@ -764,7 +784,8 @@ export async function startVideoProcessing(
             }
           },
           jobId,
-          jobAbort.signal
+          jobAbort.signal,
+          mediaInfo.isPortrait
         );
 
         tryUnlink(rawPath);

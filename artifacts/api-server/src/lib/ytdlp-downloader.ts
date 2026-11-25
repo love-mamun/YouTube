@@ -74,8 +74,8 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 function buildStrategies(hasCookies: boolean, hasPot: boolean): ClientStrategy[] {
   if (hasPot && hasCookies) {
     return [
+      { client: "default", useCookies: true, usePot: true, useMissingPotFlag: false },
       { client: "web", useCookies: true, usePot: true, useMissingPotFlag: false },
-      { client: "tv_embedded", useCookies: true, usePot: true, useMissingPotFlag: false },
       { client: "mweb", useCookies: true, usePot: true, useMissingPotFlag: false },
       { client: "web", useCookies: false, usePot: true, useMissingPotFlag: false },
       { client: "android_vr", useCookies: false, usePot: false, useMissingPotFlag: true },
@@ -83,23 +83,75 @@ function buildStrategies(hasCookies: boolean, hasPot: boolean): ClientStrategy[]
   }
   if (hasPot && !hasCookies) {
     return [
+      { client: "default", useCookies: false, usePot: true, useMissingPotFlag: false },
       { client: "web", useCookies: false, usePot: true, useMissingPotFlag: false },
       { client: "android_vr", useCookies: false, usePot: false, useMissingPotFlag: true },
       { client: "mweb", useCookies: false, usePot: true, useMissingPotFlag: false },
     ];
   }
   if (!hasPot && hasCookies) {
-    // Without PO token server, tv_embedded & android_vr avoid web SABR stalls
+    // yt-dlp's default client chain handles tv_simply + web_embedded + web automatically
     return [
-      { client: "tv_embedded", useCookies: true, usePot: false, useMissingPotFlag: true },
-      { client: "android_vr", useCookies: false, usePot: false, useMissingPotFlag: true },
+      { client: "default", useCookies: true, usePot: false, useMissingPotFlag: true },
+      { client: "mweb", useCookies: true, usePot: false, useMissingPotFlag: true },
       { client: "web", useCookies: true, usePot: false, useMissingPotFlag: true },
+      { client: "android_vr", useCookies: false, usePot: false, useMissingPotFlag: true },
     ];
   }
   return [
     { client: "android_vr", useCookies: false, usePot: false, useMissingPotFlag: true },
-    { client: "tv_embedded", useCookies: false, usePot: false, useMissingPotFlag: true },
+    { client: "default", useCookies: false, usePot: false, useMissingPotFlag: true },
   ];
+}
+
+export function buildExtractorArgsForStrategy(strat: ClientStrategy): string[] {
+  if (strat.client === "default") {
+    return strat.useMissingPotFlag ? ["--extractor-args", "youtube:formats=missing_pot"] : [];
+  }
+  return [
+    "--extractor-args",
+    strat.useMissingPotFlag
+      ? `youtube:player_client=${strat.client};formats=missing_pot`
+      : `youtube:player_client=${strat.client}`,
+  ];
+}
+
+export function buildDownloadFormatPlan(options: {
+  quality?: string | null;
+  codec?: string | null;
+}): { isStrict4K: boolean; sortArgs: string[]; formatSelectors: string[] } {
+  const { quality, codec } = options;
+  const isStrict4K = quality?.toLowerCase() === "4k";
+  const maxH = quality ? (HEIGHT_MAP[quality.toLowerCase()] ?? 1080) : 1080;
+  const vcodecFilter = codec && VCODEC_MAP[codec] ? `[vcodec^=${VCODEC_MAP[codec]}]` : "";
+
+  if (isStrict4K) {
+    // Strict 4K policy: NEVER accept below 2160p (supports both 16:9 height>=2160 and 9:16 width>=2160)
+    const formatSelectors = vcodecFilter
+      ? [
+          `bestvideo*[height>=2160]${vcodecFilter}+bestaudio/bestvideo*[width>=2160][aspect_ratio<1]${vcodecFilter}+bestaudio/bestvideo*[height>=2160]+bestaudio/bestvideo*[width>=2160][aspect_ratio<1]+bestaudio`,
+        ]
+      : [
+          "bestvideo*[height>=2160]+bestaudio/bestvideo*[width>=2160][aspect_ratio<1]+bestaudio/best[height>=2160]",
+        ];
+    return { isStrict4K: true, sortArgs: [], formatSelectors };
+  }
+
+  // Use yt-dlp -S "res:${maxH}" so portrait Shorts (e.g. 1080x1918) are NOT downgraded to 480p
+  if (quality) {
+    const formatSelectors = vcodecFilter
+      ? [`bestvideo*${vcodecFilter}+bestaudio/bestvideo*+bestaudio/b`]
+      : ["bestvideo*+bestaudio/b"];
+    return { isStrict4K: false, sortArgs: ["-S", `res:${maxH}`], formatSelectors };
+  }
+
+  // Metadata-only ("No Download") fallback download at publish time:
+  // Cap to 1080p on shorter edge and prefer MP4/M4A compatibility when available.
+  return {
+    isStrict4K: false,
+    sortArgs: ["-S", "res:1080,ext:mp4:m4a"],
+    formatSelectors: ["bestvideo*+bestaudio/b"],
+  };
 }
 
 function getPrefixFileBytes(targetOutputPath: string): number {
@@ -150,6 +202,26 @@ interface SpawnYtDlpOptions {
   signal?: AbortSignal;
 }
 
+function resolveYtDlpCommand(): { bin: string; prefixArgs: string[]; extraPythonPath?: string } {
+  const pkgDir = "/tmp/ytdlp-pkg";
+  const zipBin = "/tmp/ytdlp-bin/yt-dlp";
+  if (existsSync("/usr/local/bin/yt-dlp")) {
+    return { bin: "/usr/local/bin/yt-dlp", prefixArgs: [] };
+  }
+  if (existsSync("/usr/bin/yt-dlp")) {
+    return { bin: "/usr/bin/yt-dlp", prefixArgs: [] };
+  }
+  if (existsSync(path.join(pkgDir, "yt_dlp", "__main__.py"))) {
+    const basePy = (YTDLP_ENV as NodeJS.ProcessEnv).PYTHONPATH;
+    const existingPy = basePy ? `${basePy}:${pkgDir}` : pkgDir;
+    return { bin: "python3", prefixArgs: ["-m", "yt_dlp"], extraPythonPath: existingPy };
+  }
+  if (existsSync(zipBin)) {
+    return { bin: "python3", prefixArgs: [zipBin] };
+  }
+  return { bin: "python3", prefixArgs: ["-m", "yt_dlp"] };
+}
+
 function spawnYtDlpRaw(
   args: string[],
   opts: SpawnYtDlpOptions = {}
@@ -174,8 +246,14 @@ function spawnYtDlpRaw(
     let lastWatchedBytes = watchOutputPath ? getPrefixFileBytes(watchOutputPath) : 0;
 
     const storeDir = getVideoStoreDir();
-    const proc = spawn("python3", ["-m", "yt_dlp", ...args], {
-      env: { ...YTDLP_ENV, PYTHONUNBUFFERED: "1", TMPDIR: storeDir },
+    const resolved = resolveYtDlpCommand();
+    const proc = spawn(resolved.bin, [...resolved.prefixArgs, ...args], {
+      env: {
+        ...YTDLP_ENV,
+        ...(resolved.extraPythonPath ? { PYTHONPATH: resolved.extraPythonPath } : {}),
+        PYTHONUNBUFFERED: "1",
+        TMPDIR: storeDir,
+      },
     });
 
     const cleanupTimers = () => {
@@ -272,15 +350,18 @@ function spawnYtDlpRaw(
   });
 }
 
-async function probeVideoHeight(filePath: string): Promise<number | null> {
+async function probeVideoShortEdge(filePath: string): Promise<{ minDim: number; maxDim: number } | null> {
   try {
     const { stdout } = await execFileAsync(
       "ffprobe",
-      ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", filePath],
+      ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", filePath],
       { timeout: 10_000 }
     );
-    const parsed = parseInt(stdout.trim(), 10);
-    return Number.isNaN(parsed) ? null : parsed;
+    const parts = stdout.trim().split(",").map((n) => parseInt(n.trim(), 10));
+    if (parts.length >= 2 && !Number.isNaN(parts[0]) && !Number.isNaN(parts[1]) && parts[0] > 0 && parts[1] > 0) {
+      return { minDim: Math.min(parts[0], parts[1]), maxDim: Math.max(parts[0], parts[1]) };
+    }
+    return null;
   } catch {
     return null;
   }
@@ -306,9 +387,7 @@ export async function fetchYtDlpMetadataShared(url: string): Promise<YtDlpMeta> 
     }
 
     for (const chosen of candidates) {
-      const extractorVal = chosen.useMissingPotFlag
-        ? `youtube:player_client=${chosen.client};formats=missing_pot`
-        : `youtube:player_client=${chosen.client}`;
+      const extractorArgs = buildExtractorArgsForStrategy(chosen);
 
       const args: string[] = [
         "--dump-json",
@@ -320,8 +399,12 @@ export async function fetchYtDlpMetadataShared(url: string): Promise<YtDlpMeta> 
         "--extractor-retries", "1",
         ...JS_RUNTIME_ARGS,
         ...(chosen.usePot ? pot.extractorArgs : []),
-        "--extractor-args", extractorVal,
-        ...(chosen.useCookies && cookieCopy.path ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA] : []),
+        ...extractorArgs,
+        ...(chosen.useCookies && cookieCopy.path
+          ? chosen.client === "web"
+            ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
+            : ["--cookies", cookieCopy.path]
+          : []),
         ...(proxyUrl ? ["--proxy", proxyUrl] : []),
         url,
       ];
@@ -353,40 +436,7 @@ export async function downloadVideoWithResilience(options: {
   signal?: AbortSignal;
 }): Promise<void> {
   const { url, quality, outputPath, onProgress, codec, jobTag = "dl", signal } = options;
-  const isStrict4K = quality?.toLowerCase() === "4k";
-  const maxH = quality ? (HEIGHT_MAP[quality.toLowerCase()] ?? 1080) : 1080;
-  const vcodecFilter = codec && VCODEC_MAP[codec] ? `[vcodec^=${VCODEC_MAP[codec]}]` : "";
-
-  const formatSelectors: string[] = [];
-  if (isStrict4K) {
-    // Strict 4K policy: NEVER match below 2160p, NEVER fall back to "best"
-    if (vcodecFilter) {
-      formatSelectors.push(
-        `bestvideo*[height>=2160]${vcodecFilter}+bestaudio/bestvideo*[height>=2160]+bestaudio`
-      );
-    } else {
-      formatSelectors.push(
-        "bestvideo*[height>=2160]+bestaudio/best[height>=2160]"
-      );
-    }
-  } else if (quality) {
-    if (vcodecFilter) {
-      formatSelectors.push(
-        `bestvideo*[height<=${maxH}]${vcodecFilter}+bestaudio/bestvideo*[height<=${maxH}]+bestaudio/b[height<=${maxH}]/b`
-      );
-    } else {
-      formatSelectors.push(
-        `bestvideo*[height<=${maxH}]+bestaudio/b[height<=${maxH}]/b`
-      );
-    }
-  } else {
-    // Metadata-only ("No Download") fallback download at publish time:
-    // Cap to 1080p MP4-compatible streams so publishing doesn't pull massive 4K/8K files unexpectedly.
-    formatSelectors.push(
-      "bestvideo*[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo*[height<=1080]+bestaudio/b[height<=1080]/b"
-    );
-  }
-
+  const { isStrict4K, sortArgs, formatSelectors } = buildDownloadFormatPlan({ quality, codec });
   const uniqueFormats = Array.from(new Set(formatSelectors));
   const storeDir = getVideoStoreDir();
   const diskInfo = getDiskSpaceInfo(storeDir);
@@ -403,6 +453,7 @@ export async function downloadVideoWithResilience(options: {
   const strategies = buildStrategies(cookieCopy.hasCookies, pot.mode !== "none");
 
   const commonArgs = [
+    ...sortArgs,
     "--merge-output-format", "mp4",
     "--no-playlist",
     "--no-check-formats",
@@ -420,8 +471,10 @@ export async function downloadVideoWithResilience(options: {
 
   let lastError = "";
   let rateLimitHits = 0;
-  let botCheckHit = false;
+  let botCheckWithCookiesHit = false;
+  let botCheckAnonHit = false;
   let formatMiss4KHit = false;
+  let last4KFormatError = "";
   let stallHits = 0;
   let proxyTimeoutHits = 0;
 
@@ -435,9 +488,7 @@ export async function downloadVideoWithResilience(options: {
       }
 
       const strat = strategies[sIdx];
-      const extractorVal = strat.useMissingPotFlag
-        ? `youtube:player_client=${strat.client};formats=missing_pot`
-        : `youtube:player_client=${strat.client}`;
+      const extractorArgs = buildExtractorArgsForStrategy(strat);
 
       for (const fmt of uniqueFormats) {
         if (signal?.aborted) {
@@ -464,7 +515,7 @@ export async function downloadVideoWithResilience(options: {
           await spawnYtDlpRaw(
             [
               "-f", fmt,
-              "--extractor-args", extractorVal,
+              ...extractorArgs,
               ...(strat.usePot ? pot.extractorArgs : []),
               ...(strat.useCookies && cookieCopy.path
                 ? strat.client === "web"
@@ -483,13 +534,13 @@ export async function downloadVideoWithResilience(options: {
             }
           );
 
-          // Strict 4K verification via ffprobe
+          // Strict 4K verification via ffprobe (supports both 16:9 3840x2160 and 9:16 2160x3840)
           if (isStrict4K && existsSync(outputPath)) {
-            const actualHeight = await probeVideoHeight(outputPath);
-            if (actualHeight !== null && actualHeight < 2160) {
+            const dims = await probeVideoShortEdge(outputPath);
+            if (dims && dims.minDim < 2160 && dims.maxDim < 3840) {
               try { unlinkSync(outputPath); } catch { /* noop */ }
               throw new Error(
-                `[4K_UNAVAILABLE] Strict 4K aborted: downloaded stream height was ${actualHeight}p (< 2160p).`
+                `[4K_UNAVAILABLE] Strict 4K aborted: downloaded stream resolution was ${dims.minDim}p (< 2160p).`
               );
             }
           }
@@ -564,11 +615,18 @@ export async function downloadVideoWithResilience(options: {
           }
 
           if (/Sign in to confirm you.?re not a bot|cookies are no longer valid|do-i-pass-cookies-to-yt-dlp/i.test(lastError)) {
-            botCheckHit = true;
+            if (strat.useCookies && cookieCopy.hasCookies) {
+              botCheckWithCookiesHit = true;
+            } else {
+              botCheckAnonHit = true;
+            }
           }
 
-          if (/Requested format is not available/i.test(lastError) && isStrict4K) {
+          if (/Requested format is not available|\[4K_UNAVAILABLE\]/i.test(lastError) && isStrict4K) {
             formatMiss4KHit = true;
+            if (!last4KFormatError || (strat.useCookies && cookieCopy.hasCookies)) {
+              last4KFormatError = lastError;
+            }
           }
 
           if (/stalled|timed out/i.test(lastError)) {
@@ -587,17 +645,18 @@ export async function downloadVideoWithResilience(options: {
     const prioritizedError =
       rateLimitHits > 0 && !/429|Too Many Requests/i.test(lastError)
         ? `HTTP Error 429: Too Many Requests (${lastError})`
-        : botCheckHit && !/not a bot|do-i-pass-cookies-to-yt-dlp/i.test(lastError)
+        : formatMiss4KHit && isStrict4K && !botCheckWithCookiesHit
+        ? (last4KFormatError || "Requested format is not available for 2160p.")
+        : (botCheckWithCookiesHit || (!formatMiss4KHit && botCheckAnonHit)) &&
+          !/not a bot|do-i-pass-cookies-to-yt-dlp|cookies are no longer valid/i.test(lastError)
         ? `Sign in to confirm you're not a bot (${lastError})`
-        : formatMiss4KHit && isStrict4K && !/4K_UNAVAILABLE/i.test(lastError)
-        ? `Requested format is not available for 2160p (${lastError})`
         : stallHits > 0 && !/stalled|timed out/i.test(lastError)
         ? `Download stalled waiting on YouTube stream (${lastError})`
         : lastError;
 
     const classified = classifyYtDlpError(prioritizedError, {
       quality,
-      usedCookies: cookieCopy.hasCookies,
+      usedCookies: cookieCopy.hasCookies && (!formatMiss4KHit || botCheckWithCookiesHit),
       usedProxy: Boolean(proxyUrl),
       proxyMaskedHost: maskedProxy,
       potMode: pot.mode,
@@ -706,9 +765,7 @@ export async function runYtDlpDiagnostics(opts: {
     const chosen = strategies[0];
     report.probe.clientUsed = chosen.client;
 
-    const extractorVal = chosen.useMissingPotFlag
-      ? `youtube:player_client=${chosen.client};formats=missing_pot`
-      : `youtube:player_client=${chosen.client}`;
+    const extractorArgs = buildExtractorArgsForStrategy(chosen);
 
     const { stdout } = await spawnYtDlpRaw(
       [
@@ -719,18 +776,22 @@ export async function runYtDlpDiagnostics(opts: {
         "--socket-timeout", "25",
         ...JS_RUNTIME_ARGS,
         ...(chosen.usePot ? pot.extractorArgs : []),
-        "--extractor-args", extractorVal,
-        ...(chosen.useCookies && cookieCopy.path ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA] : []),
+        ...extractorArgs,
+        ...(chosen.useCookies && cookieCopy.path
+          ? chosen.client === "web"
+            ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
+            : ["--cookies", cookieCopy.path]
+          : []),
         ...(effectiveProxy ? ["--proxy", effectiveProxy] : []),
         targetUrl,
       ],
       { timeoutMs: 40_000, stallTimeoutMs: 35_000 }
     );
 
-    const parsed = JSON.parse(stdout) as { formats?: Array<{ height?: number; vcodec?: string }> };
+    const parsed = JSON.parse(stdout) as { formats?: Array<{ width?: number; height?: number; vcodec?: string }> };
     const heights = (parsed.formats ?? [])
       .filter((f) => typeof f.height === "number" && f.height > 0 && f.vcodec !== "none")
-      .map((f) => f.height as number);
+      .map((f) => (typeof f.width === "number" && f.width > 0 ? Math.min(f.width, f.height!) : f.height!));
     const maxHeight = heights.length > 0 ? Math.max(...heights) : null;
 
     report.probe.ok = true;
