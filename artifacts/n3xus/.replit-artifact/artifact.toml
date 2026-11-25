@@ -1,0 +1,23 @@
+title = "N3XUS Auto Video Publisher"
+
+[[services]]
+localPort = 3000
+name = "N3XUS Frontend"
+paths = ["/"]
+
+[services.development]
+run = "PORT=$PORT BASE_PATH=/ pnpm --filter @workspace/n3xus run dev"
+
+[services.production]
+serve = "static"
+publicDir = "artifacts/n3xus/dist/public"
+
+[services.production.build]
+args = ["pnpm", "--filter", "@workspace/n3xus", "run", "build"]
+
+[services.production.build.env]
+BASE_PATH = "/"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"

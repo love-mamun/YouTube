@@ -1,0 +1,640 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: N3XUS Auto Video Publisher API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: jobs
+    description: Video job operations
+  - name: content
+    description: AI generated content
+  - name: thumbnails
+    description: Thumbnail operations
+  - name: tokens
+    description: Platform API token management
+  - name: channels
+    description: Connected platform channels
+  - name: stats
+    description: Dashboard statistics
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /jobs:
+    get:
+      operationId: listJobs
+      tags: [jobs]
+      summary: List all video jobs
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VideoJob"
+    post:
+      operationId: createJob
+      tags: [jobs]
+      summary: Create a new video job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VideoJobInput"
+      responses:
+        "201":
+          description: Job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VideoJob"
+
+  /jobs/{id}:
+    get:
+      operationId: getJob
+      tags: [jobs]
+      summary: Get a job by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Job details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VideoJob"
+        "404":
+          description: Not found
+    delete:
+      operationId: deleteJob
+      tags: [jobs]
+      summary: Delete a job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /jobs/{id}/status:
+    get:
+      operationId: getJobStatus
+      tags: [jobs]
+      summary: Get job processing status and progress
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatus"
+
+  /jobs/{id}/process:
+    post:
+      operationId: processJob
+      tags: [jobs]
+      summary: Start processing a job (download + AI generation)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Processing started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VideoJob"
+
+  /jobs/{id}/publish:
+    post:
+      operationId: publishJob
+      tags: [jobs]
+      summary: Publish job to selected platforms
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublishOptions"
+      responses:
+        "200":
+          description: Publish initiated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VideoJob"
+
+  /jobs/{id}/approve:
+    post:
+      operationId: approveJob
+      tags: [jobs]
+      summary: Approve job for publishing
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Job approved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VideoJob"
+
+  /jobs/{id}/content:
+    get:
+      operationId: getJobContent
+      tags: [content]
+      summary: Get AI generated content for a job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: AI content
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiContent"
+    put:
+      operationId: updateJobContent
+      tags: [content]
+      summary: Update AI generated content
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AiContentUpdate"
+      responses:
+        "200":
+          description: Updated content
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiContent"
+
+  /jobs/{id}/regenerate-content:
+    post:
+      operationId: regenerateContent
+      tags: [content]
+      summary: Regenerate AI content using Gemini
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Regenerated content
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiContent"
+
+  /jobs/{id}/thumbnails:
+    get:
+      operationId: getJobThumbnails
+      tags: [thumbnails]
+      summary: Get thumbnail variants for a job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Thumbnail variants
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Thumbnail"
+
+  /jobs/{id}/select-thumbnail:
+    post:
+      operationId: selectThumbnail
+      tags: [thumbnails]
+      summary: Select a thumbnail for publishing
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ThumbnailSelection"
+      responses:
+        "200":
+          description: Thumbnail selected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VideoJob"
+
+  /tokens:
+    get:
+      operationId: listTokens
+      tags: [tokens]
+      summary: List all connected platform tokens
+      responses:
+        "200":
+          description: List of tokens
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ApiToken"
+    post:
+      operationId: createToken
+      tags: [tokens]
+      summary: Add a platform API token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApiTokenInput"
+      responses:
+        "201":
+          description: Token saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiToken"
+
+  /tokens/{id}:
+    delete:
+      operationId: deleteToken
+      tags: [tokens]
+      summary: Remove a platform token
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /channels:
+    get:
+      operationId: listChannels
+      tags: [channels]
+      summary: List all connected channels
+      responses:
+        "200":
+          description: Channels
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Channel"
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [stats]
+      summary: Get dashboard stats
+      responses:
+        "200":
+          description: Dashboard stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardStats"
+
+  /publish-logs:
+    get:
+      operationId: listPublishLogs
+      tags: [jobs]
+      summary: List recent publish logs
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Publish logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PublishLog"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    VideoJob:
+      type: object
+      required: [id, status, createdAt]
+      properties:
+        id:
+          type: integer
+        youtubeUrl:
+          type: ["string", "null"]
+        title:
+          type: ["string", "null"]
+        originalTitle:
+          type: ["string", "null"]
+        description:
+          type: ["string", "null"]
+        tags:
+          type: ["string", "null"]
+        thumbnailUrl:
+          type: ["string", "null"]
+        selectedThumbnailId:
+          type: ["integer", "null"]
+        status:
+          type: string
+          enum: [pending, downloading, processing, generating, ready, approved, publishing, published, failed]
+        publishMode:
+          type: ["string", "null"]
+          enum: [auto, scheduled, manual, null]
+        scheduledAt:
+          type: ["string", "null"]
+        platforms:
+          type: ["string", "null"]
+        errorMessage:
+          type: ["string", "null"]
+        progress:
+          type: ["integer", "null"]
+        videoPath:
+          type: ["string", "null"]
+        duration:
+          type: ["integer", "null"]
+        createdAt:
+          type: string
+        updatedAt:
+          type: ["string", "null"]
+
+    VideoJobInput:
+      type: object
+      properties:
+        youtubeUrl:
+          type: string
+        publishMode:
+          type: string
+          enum: [auto, scheduled, manual]
+        scheduledAt:
+          type: ["string", "null"]
+        platforms:
+          type: string
+        quality:
+          type: string
+          enum: [360p, 480p, 720p, 1080p, 1440p, 4k]
+        codec:
+          type: string
+          enum: [av1, vp9, h264]
+        missionType:
+          type: string
+          enum: [normal, 4k]
+
+    JobStatus:
+      type: object
+      required: [id, status, progress]
+      properties:
+        id:
+          type: integer
+        status:
+          type: string
+        progress:
+          type: integer
+        currentStep:
+          type: ["string", "null"]
+        errorMessage:
+          type: ["string", "null"]
+
+    AiContent:
+      type: object
+      required: [jobId]
+      properties:
+        jobId:
+          type: integer
+        title:
+          type: ["string", "null"]
+        description:
+          type: ["string", "null"]
+        tags:
+          type: ["string", "null"]
+        hashtags:
+          type: ["string", "null"]
+
+    AiContentUpdate:
+      type: object
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        tags:
+          type: string
+        hashtags:
+          type: string
+
+    Thumbnail:
+      type: object
+      required: [id, jobId]
+      properties:
+        id:
+          type: integer
+        jobId:
+          type: integer
+        variantIndex:
+          type: integer
+        imageUrl:
+          type: string
+        label:
+          type: ["string", "null"]
+        isSelected:
+          type: boolean
+
+    ThumbnailSelection:
+      type: object
+      required: [thumbnailId]
+      properties:
+        thumbnailId:
+          type: integer
+
+    PublishOptions:
+      type: object
+      required: [platforms]
+      properties:
+        platforms:
+          type: string
+        scheduledAt:
+          type: ["string", "null"]
+
+    ApiToken:
+      type: object
+      required: [id, platform, createdAt]
+      properties:
+        id:
+          type: integer
+        platform:
+          type: string
+          enum: [youtube, facebook]
+        label:
+          type: ["string", "null"]
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+
+    ApiTokenInput:
+      type: object
+      required: [platform, accessToken]
+      properties:
+        platform:
+          type: string
+          enum: [youtube, facebook]
+        accessToken:
+          type: string
+        refreshToken:
+          type: ["string", "null"]
+        label:
+          type: ["string", "null"]
+
+    Channel:
+      type: object
+      required: [id, platform, channelName]
+      properties:
+        id:
+          type: integer
+        platform:
+          type: string
+        channelName:
+          type: string
+        channelId:
+          type: ["string", "null"]
+        subscriberCount:
+          type: ["integer", "null"]
+        isActive:
+          type: boolean
+
+    DashboardStats:
+      type: object
+      required: [totalJobs, publishedToday, pendingJobs, failedJobs, totalPublished, processingJobs]
+      properties:
+        totalJobs:
+          type: integer
+        publishedToday:
+          type: integer
+        pendingJobs:
+          type: integer
+        failedJobs:
+          type: integer
+        totalPublished:
+          type: integer
+        processingJobs:
+          type: integer
+        recentActivity:
+          type: array
+          items:
+            $ref: "#/components/schemas/VideoJob"
+
+    PublishLog:
+      type: object
+      required: [id, jobId, platform, createdAt]
+      properties:
+        id:
+          type: integer
+        jobId:
+          type: integer
+        platform:
+          type: string
+        status:
+          type: string
+          enum: [success, failed, pending]
+        platformVideoId:
+          type: ["string", "null"]
+        platformUrl:
+          type: ["string", "null"]
+        errorMessage:
+          type: ["string", "null"]
+        createdAt:
+          type: string

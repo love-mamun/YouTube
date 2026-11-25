@@ -1,0 +1,606 @@
+Build a full-stack SaaS web application called **N3XUS Auto Video Publisher** — a "Mission Control" platform that lets users paste a YouTube or Facebook video URL, automatically downloads the video, generates AI-powered SEO content (title, description, tags, hashtags) using Google Gemini, creates thumbnail variants, and publishes to YouTube and/or Facebook.
+
+═══════════════════════════════════════════════════════════════
+TECH STACK
+═══════════════════════════════════════════════════════════════
+
+- Monorepo: pnpm workspaces, Node.js 24, TypeScript 5.9
+- Frontend: React 19 + Vite, wouter (routing), framer-motion (animations), lucide-react (icons), Tailwind CSS v4
+- API: Express 5 (port 8080, proxied at /api)
+- Database: PostgreSQL + Drizzle ORM
+- AI: Google Gemini 2.0 Flash via REST API
+- Video download: yt-dlp (Python, installed via pip)
+- Video processing: FFmpeg (for 4K re-encoding, watermarking, fingerprint-breaking)
+- API contract: OpenAPI spec → Orval codegen → Zod validators + React Query hooks
+- Build: esbuild (CJS bundle for api-server)
+
+═══════════════════════════════════════════════════════════════
+DESIGN / THEME
+═══════════════════════════════════════════════════════════════
+
+- Dark "mission control" aesthetic
+- Background: #0a0a0f (near-black)
+- Primary/accent: #00d4ff (cyan)
+- Font: Space Grotesk (headings/body), JetBrains Mono (labels, codes, badges)
+- Animated star-field particle background on all pages
+- Glowing cyan borders, subtle glassmorphism cards
+- Status badges with color coding: pending=gray, downloading=blue, processing=yellow, ready=green, published=cyan, failed=red
+- All section labels in UPPERCASE monospace tracking-widest style
+
+═══════════════════════════════════════════════════════════════
+DATABASE SCHEMA (PostgreSQL + Drizzle ORM)
+═══════════════════════════════════════════════════════════════
+
+Table: video_jobs
+  - id (serial PK)
+  - youtube_url (text) — source video URL (YouTube or Facebook)
+  - original_title (text)
+  - original_description (text)
+  - title (text) — AI-generated
+  - description (text) — AI-generated
+  - tags (text) — comma-separated
+  - hashtags (text) — AI-generated hashtag block
+  - status (text) — enum: pending | downloading | processing | generating | ready | approved | publishing | published | failed
+  - progress (integer 0–100)
+  - quality (text) — enum: 360p | 480p | 720p | 1080p | 1440p | 4k | null
+  - codec (text) — enum: any | av1 | vp9 | h264 | null
+  - mission_type (text) — enum: normal | 4k
+  - publish_mode (text) — enum: manual | auto | scheduled
+  - platforms (text) — comma-separated: youtube, facebook, youtube-shorts
+  - scheduled_at (timestamp)
+  - thumbnail_url (text)
+  - selected_thumbnail_id (integer, FK → thumbnails)
+  - video_path (text) — local file path after download
+  - duration (integer) — seconds
+  - error_message (text)
+  - created_at, updated_at (timestamps)
+
+Table: thumbnails
+  - id (serial PK)
+  - job_id (FK → video_jobs)
+  - variant_index (integer)
+  - image_url (text)
+  - label (text) — e.g. "Max Resolution", "HQ Default", "Medium Quality", "Standard"
+  - is_selected (boolean)
+  - created_at (timestamp)
+
+Table: channels
+  - id (serial PK)
+  - platform (text) — youtube | facebook
+  - channel_id (text) — platform-specific ID
+  - channel_name (text)
+  - thumbnail_url (text)
+  - subscriber_count (integer)
+  - token_id (FK → api_tokens)
+  - is_active (boolean)
+  - is_default (boolean)
+  - created_at (timestamp)
+
+Table: api_tokens
+  - id (serial PK)
+  - platform (text) — youtube | facebook
+  - access_token (text)
+  - refresh_token (text)
+  - expires_at (timestamp)
+  - is_active (boolean)
+  - created_at (timestamp)
+
+Table: publish_logs
+  - id (serial PK)
+  - job_id (FK → video_jobs)
+  - platform (text)
+  - status (text) — pending | success | failed
+  - platform_url (text) — published video URL
+  - error_message (text)
+  - created_at (timestamp)
+
+Table: app_config
+  - id (serial PK)
+  - key (text, unique)
+  - value (text)
+  - updated_at (timestamp)
+
+═══════════════════════════════════════════════════════════════
+BACKEND API ROUTES (Express 5)
+═══════════════════════════════════════════════════════════════
+
+── Jobs ──────────────────────────────────────────────────────
+GET    /api/jobs                  — list all jobs (paginated, filterable by status)
+POST   /api/jobs                  — create job (body: youtubeUrl, publishMode, platforms, quality, codec, missionType, scheduledAt)
+GET    /api/jobs/:id              — get single job
+DELETE /api/jobs/:id              — delete job + its video file
+GET    /api/jobs/:id/status       — lightweight status + progress polling endpoint
+POST   /api/jobs/:id/process      — manually trigger processing
+POST   /api/jobs/:id/approve      — mark job as approved
+POST   /api/jobs/:id/publish      — trigger publish pipeline
+
+── Content ───────────────────────────────────────────────────
+GET    /api/jobs/:id/content      — get AI-generated content fields
+PUT    /api/jobs/:id/content      — update title/description/tags/hashtags
+POST   /api/jobs/:id/regenerate-content — re-run Gemini AI generation
+
+── Thumbnails ────────────────────────────────────────────────
+GET    /api/jobs/:id/thumbnails   — list thumbnail variants
+POST   /api/jobs/:id/select-thumbnail — set active thumbnail (body: thumbnailId)
+
+── Stats ─────────────────────────────────────────────────────
+GET    /api/stats                 — { totalJobs, publishedToday, inQueue, totalPublished }
+
+── Publish Logs ──────────────────────────────────────────────
+GET    /api/publish-logs          — full audit log
+
+── Tokens / Settings ─────────────────────────────────────────
+GET    /api/tokens                — list API tokens
+POST   /api/tokens                — add token (platform, accessToken, refreshToken)
+DELETE /api/tokens/:id            — remove token
+
+── Channels ──────────────────────────────────────────────────
+GET    /api/channels              — list connected channels
+POST   /api/channels              — add channel
+DELETE /api/channels/:id          — remove channel
+POST   /api/channels/:id/set-default — set as default publish channel
+
+── App Config ────────────────────────────────────────────────
+GET    /api/settings              — get all config key/values
+POST   /api/settings              — upsert config key/value (watermark_text, etc.)
+
+── YouTube OAuth ─────────────────────────────────────────────
+GET    /api/auth/youtube          — start OAuth2 flow
+GET    /api/auth/youtube/callback — OAuth2 callback, save token + channel
+
+── YouTube Data API ──────────────────────────────────────────
+GET    /api/youtube/channel-info        — fetch connected channel stats + health score
+GET    /api/youtube/my-videos           — list uploaded videos (paginated)
+GET    /api/youtube/trending            — trending videos by category/region
+GET    /api/youtube/search              — search YouTube videos
+GET    /api/youtube/video/:id/stats     — single video stats
+POST   /api/youtube/video/:id/update-metadata — update title/description/tags
+GET    /api/youtube/video/:id/comments  — list comments
+POST   /api/youtube/video/:id/comment-reply — reply to a comment
+GET    /api/youtube/playlists           — list playlists
+POST   /api/youtube/video/:id/add-to-playlist — add video to playlist
+GET    /api/youtube/categories          — list video categories
+POST   /api/youtube/import-video        — create a job from an existing YouTube video
+
+── AI Tools ──────────────────────────────────────────────────
+POST   /api/ai/script             — generate full YouTube script from title + description
+POST   /api/ai/translate          — translate title/description/tags into target language
+POST   /api/ai/hooks              — generate viral title hooks/variations
+POST   /api/ai/reply              — generate comment reply suggestions
+POST   /api/ai/chapters           — generate timestamped chapter list from description
+
+── Health ────────────────────────────────────────────────────
+GET    /api/health                — { status: "ok" }
+
+═══════════════════════════════════════════════════════════════
+VIDEO PROCESSING PIPELINE (backend lib)
+═══════════════════════════════════════════════════════════════
+
+When a job is created, startVideoProcessing() runs automatically in the background:
+
+Stage 1 — Metadata fetch (status: downloading, progress: 5–15%)
+  - Run yt-dlp --dump-json to get title, description, duration, thumbnail, tags
+  - Fallback: YouTube oEmbed API for title if yt-dlp fails
+  - Thumbnail fallback: https://img.youtube.com/vi/{id}/maxresdefault.jpg
+
+Stage 2 — Download video (status: downloading, progress: 20–43%)
+  Only runs if quality is set (not null/none)
+  - yt-dlp format selector respects chosen quality + codec:
+    bestvideo[height<=N][vcodec^=CODEC]+bestaudio/best[height<=N]
+  - Tries multiple client strategies: android_vr → ios → web → tv_embedded
+  - Output: .video-store/job-{id}-raw.mp4
+
+Stage 3 — FFmpeg pipeline (status: processing, progress: 45–72%)
+  Only for missionType="4k" jobs
+  - Strip all metadata (-map_metadata -1) → breaks fingerprinting
+  - Video filter: speed tweak (setpts=0.98*PTS), scale to target res (lanczos), crop 2px edges, drawtext watermark (center-bottom, 50% opacity)
+  - Audio filter: atempo=1.02, asetrate=44982, aresample=44100
+  - Re-encode: libx264 + AAC
+  - FFmpeg spawned detached (detached:true + proc.unref()) so it SURVIVES server restarts
+  - PID written to .video-store/job-{id}-ffmpeg.pid
+  - Progress written by FFmpeg to .video-store/job-{id}-ffmpeg-progress.txt (via -progress flag)
+  - Output: .video-store/job-{id}-processed.mp4
+
+Stage 4 — AI content generation (progress: 73–90%)
+  - Gemini 2.0 Flash generates: SEO title, description (500 words), 30 tags, 10 hashtags
+  - Prompt includes original title, description, platform, duration
+  - Saves to DB
+
+Stage 5 — Thumbnails (progress: 90%)
+  - 4 variants generated from YouTube CDN: maxresdefault, hqdefault, mqdefault, sddefault
+  - Stored in thumbnails table, first one pre-selected
+
+Stage 6 — Ready (status: ready, progress: 100%)
+  - If publishMode="auto", immediately triggers publish pipeline
+  - If publishMode="scheduled", waits until scheduledAt
+
+Publish pipeline:
+  - For YouTube: use stored job.videoPath (the already-downloaded file), upload via YouTube Data API v3 resumable upload
+  - Includes thumbnail upload after video upload
+  - For Facebook: simulated (no real FB API yet)
+  - Logs every attempt to publish_logs table
+
+Resume on server restart (resumeStuckJobs() called at startup):
+  1. If FFmpeg PID file exists + process is alive → re-attach progress monitor, wait for completion
+  2. If processed file exists (>100KB) → skip to content stage
+  3. If raw file exists (>100KB) → skip download, re-run FFmpeg
+  4. Otherwise → full restart
+
+═══════════════════════════════════════════════════════════════
+FRONTEND PAGES
+═══════════════════════════════════════════════════════════════
+
+── Dashboard (/):
+  - Header: "MISSION CONTROL" label + "N3XUS Command Center" title
+  - Quick submit: paste YouTube URL field → instantly creates a No-Download job
+  - Stats grid (4 cards): Total Jobs | Published Today | In Queue | Total Published
+  - Recent Missions table: last 10 jobs with status badge, progress bar, title, time ago, quick Delete action
+  - Animated particle star-field background
+
+── New Mission (/new):
+  - Multi-URL input: add up to 10 URLs, each processed independently
+  - Download Quality card (radio list):
+      No Download (Fast) | 360p | 480p | 720p HD | 1080p FHD | 1440p 2K | 2160p 4K
+  - Video Codec card (appears only when quality != "none", radio list):
+      Auto (Default) | AV1 (smallest) | VP9 (medium) | H.264 (most compatible)
+  - Publish To card (checkboxes): YouTube | Facebook | YouTube Shorts
+  - Publish Mode card (radio): Manual Review | Auto Publish | Scheduled
+      → Scheduled: shows datetime picker
+  - Launch button: processes all URLs sequentially, shows per-URL status (pending/done/error)
+
+── 4K Mission (/4k-mission):
+  - Dedicated interface for 4K + FFmpeg pipeline jobs
+  - Same URL input + quality locked to 4k
+  - Shows FFmpeg processing progress with live percentage
+  - Emphasizes: fingerprint-breaking, watermark, re-encode pipeline
+
+── All Jobs (/jobs):
+  - Full paginated job list (50 per page)
+  - Filter tabs: All | Pending | Downloading | Processing | Ready | Published | Failed
+  - Each row: thumbnail, title, status badge, quality badge, progress bar, created time, Delete button
+  - Click row → navigates to Job Detail
+
+── Job Detail (/jobs/:id):
+  - Pipeline tracker (7 steps): Init → Downloading → Processing → Ready → Approved → Publishing → Done
+    Each step: icon, label, status dot (pending/active/complete/error)
+  - Video info panel: original title, source URL, quality, duration, codec
+  - AI Content panel (editable):
+      Title input, Description textarea, Tags input, Hashtags input
+      "Regenerate AI Content" button
+  - Thumbnail selector: 4 variant cards, click to select active one
+  - Action buttons: Approve | Publish to YouTube | Publish to YouTube Shorts
+  - Live polling: status refreshes every 1–2s while job is active
+
+── Channel Hub (/channel):
+  - Connected YouTube channel card: avatar, name, subscriber count, health score (0–100)
+  - Health score breakdown: Subscribers / View Ratio / Profile Completeness / Upload Frequency
+  - My Videos list: paginated upload history with view/like/comment counts
+  - Trending Videos panel: filter by category + region
+  - Search Videos panel: search YouTube within the app
+  - Import Video button: create a N3XUS job from any video in My Videos list
+
+── Discover (/discover):
+  - YouTube video search interface
+  - Trending by category (Entertainment, Music, Gaming, etc.) + region selector
+  - Each result card: thumbnail, title, channel, views, duration, tags preview
+  - "Import as Mission" button on each result → creates a new job
+
+── Telemetry Logs (/logs):
+  - Full publish log history across all platforms
+  - Each row: job title, platform, status (success/failed), published URL (clickable), timestamp
+  - Color coded: green for success, red for failed
+
+── Settings (/settings):
+  - YouTube OAuth section: "Connect YouTube Channel" button → starts OAuth flow
+  - Connected channels list with disconnect option
+  - App Config section: Watermark Text input (saved to app_config table)
+  - YouTube API credentials: Client ID + Client Secret inputs (saved to app_config)
+  - Gemini API Key info (reads from env, not editable in UI)
+
+═══════════════════════════════════════════════════════════════
+KEY COMPONENTS
+═══════════════════════════════════════════════════════════════
+
+Layout component:
+  - Left sidebar (fixed, dark): N3XUS logo + animated dot, nav links with icons, version footer
+  - Nav items: Dashboard | All Jobs | New Mission | 4K Mission | Channel Hub | Discover | Telemetry Logs | Settings
+  - Active item: cyan background highlight
+  - Main content area: scrollable, padded
+
+StatusBadge component:
+  - Small pill with color + icon for each job status
+  - pending=gray, downloading=blue, processing=yellow/amber, ready=green, approved=teal, publishing=purple, published=cyan, failed=red
+
+JobPipeline component (used in Job Detail):
+  - Horizontal step tracker showing all 7 stages
+  - Each step: circular icon, label below, connecting line
+  - States: waiting (gray) / active (cyan pulsing) / complete (green checkmark) / error (red X)
+
+═══════════════════════════════════════════════════════════════
+AI CONTENT GENERATION (Gemini)
+═══════════════════════════════════════════════════════════════
+
+Model: gemini-2.0-flash
+Auth: API key from env (GEMINI_API_KEY or AI_INTEGRATIONS_GEMINI_API_KEY)
+Direct REST call to: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent
+
+Prompt for main content:
+  Given this video metadata, generate YouTube SEO content:
+  - Title: 70 chars max, clickable, includes keywords
+  - Description: 400–500 words, structured with sections, keywords naturally placed
+  - Tags: exactly 30 comma-separated tags, mix of broad + specific
+  - Hashtags: 10 hashtags for description footer
+
+AI Tools endpoints generate:
+  - Script: full narration script with intro/hook/body/CTA sections
+  - Hooks: 10 viral title variations in different styles (curiosity, shock, number, question, etc.)
+  - Translation: localize all fields to a target language
+  - Comment replies: 5 reply options in different tones (friendly, professional, witty)
+  - Chapters: timestamped chapter list from description content
+
+═══════════════════════════════════════════════════════════════
+YOUTUBE OAUTH FLOW
+═══════════════════════════════════════════════════════════════
+
+1. User goes to Settings, clicks "Connect YouTube Channel"
+2. Server redirects to Google OAuth2 with scopes: youtube.upload, youtube.readonly, youtube.force-ssl
+3. Google redirects back to /api/auth/youtube/callback with auth code
+4. Server exchanges code for access_token + refresh_token
+5. Calls YouTube API to get channel info (name, id, thumbnail, subscriber count)
+6. Saves token to api_tokens table, channel to channels table
+7. Redirects user to /channel hub page
+
+Token refresh: googleapis OAuth2Client handles refresh automatically on token expiry
+
+═══════════════════════════════════════════════════════════════
+VIDEO UPLOAD TO YOUTUBE
+═══════════════════════════════════════════════════════════════
+
+Uses googleapis youtube.videos.insert() with resumable upload
+- Reads the already-downloaded local file (job.videoPath) — does NOT re-download
+- Falls back to re-download with quality-constrained format selector if file is missing
+- Uploads thumbnail separately via yt.thumbnails.set() after video is live
+- Sanitizes title: strips < > and control chars, truncates to 100 chars (92 for Shorts)
+- Description: main text + hashtags block + tags block, max 5000 chars
+- YouTube Shorts: appends " #Shorts" to title, adds Shorts to tags
+
+═══════════════════════════════════════════════════════════════
+ENVIRONMENT VARIABLES (required)
+═══════════════════════════════════════════════════════════════
+
+DATABASE_URL         — PostgreSQL connection string
+GEMINI_API_KEY       — Google Gemini AI key (from https://aistudio.google.com/apikey)
+SESSION_SECRET       — Express session signing secret
+YOUTUBE_CLIENT_ID    — (can also be stored in app_config DB table via Settings page)
+YOUTUBE_CLIENT_SECRET — (can also be stored in app_config DB table via Settings page)
+
+═══════════════════════════════════════════════════════════════
+FILE STORAGE
+═══════════════════════════════════════════════════════════════
+
+All video files stored locally in: /home/runner/workspace/.video-store/
+  job-{id}-raw.mp4            — downloaded video (yt-dlp output)
+  job-{id}-processed.mp4      — FFmpeg-encoded output (4K Mission only)
+  job-{id}-ffmpeg.pid         — FFmpeg process ID (for survive-restart tracking)
+  job-{id}-ffmpeg-progress.txt — FFmpeg progress output (for live %)
+
+Cleanup scheduler runs daily at midnight:
+  - Deletes video files for published jobs (they've already been uploaded)
+  - Deletes orphaned files for jobs not in DB
+  - Clears videoPath column in DB for deleted files
+
+═══════════════════════════════════════════════════════════════
+MONOREPO STRUCTURE
+═══════════════════════════════════════════════════════════════
+
+workspace/
+├── artifacts/
+│   ├── api-server/          — Express backend
+│   │   └── src/
+│   │       ├── index.ts     — server entry, calls resumeStuckJobs() on startup
+│   │       ├── app.ts       — Express app setup, route mounting
+│   │       ├── routes/      — jobs, content, thumbnails, channels, tokens, stats, publish-logs, youtube-auth, youtube-api, ai-tools, settings, health
+│   │       └── lib/
+│   │           ├── video-processor.ts  — yt-dlp download + FFmpeg pipeline + resumeStuckJobs()
+│   │           ├── youtube-publisher.ts — YouTube upload via googleapis
+│   │           ├── ai-content.ts       — Gemini REST calls
+│   │           ├── cleanup-scheduler.ts — midnig
+
+ker (7 steps): Init → Downloading → Processing → Ready → Approved → Publishing → Done
+    Each step: icon, label, status dot (pending/active/complete/error)
+  - Video info panel: original title, source URL, quality, duration, codec
+  - AI Content panel (editable):
+      Title input, Description textarea, Tags input, Hashtags input
+      "Regenerate AI Content" button
+  - Thumbnail selector: 4 variant cards, click to select active one
+  - Action buttons: Approve | Publish to YouTube | Publish to YouTube Shorts
+  - Live polling: status refreshes every 1–2s while job is active
+
+── Channel Hub (/channel):
+  - Connected YouTube channel card: avatar, name, subscriber count, health score (0–100)
+  - Health score breakdown: Subscribers / View Ratio / Profile Completeness / Upload Frequency
+  - My Videos list: paginated upload history with view/like/comment counts
+  - Trending Videos panel: filter by category + region
+  - Search Videos panel: search YouTube within the app
+  - Import Video button: create a N3XUS job from any video in My Videos list
+
+── Discover (/discover):
+  - YouTube video search interface
+  - Trending by category (Entertainment, Music, Gaming, etc.) + region selector
+  - Each result card: thumbnail, title, channel, views, duration, tags preview
+  - "Import as Mission" button on each result → creates a new job
+
+── Telemetry Logs (/logs):
+  - Full publish log history across all platforms
+  - Each row: job title, platform, status (success/failed), published URL (clickable), timestamp
+  - Color coded: green for success, red for failed
+
+── Settings (/settings):
+  - YouTube OAuth section: "Connect YouTube Channel" button → starts OAuth flow
+  - Connected channels list with disconnect option
+  - App Config section: Watermark Text input (saved to app_config table)
+  - YouTube API credentials: Client ID + Client Secret inputs (saved to app_config)
+  - Gemini API Key info (reads from env, not editable in UI)
+
+═══════════════════════════════════════════════════════════════
+KEY COMPONENTS
+═══════════════════════════════════════════════════════════════
+
+Layout component:
+  - Left sidebar (fixed, dark): N3XUS logo + animated dot, nav links with icons, version footer
+  - Nav items: Dashboard | All Jobs | New Mission | 4K Mission | Channel Hub | Discover | Telemetry Logs | Settings
+  - Active item: cyan background highlight
+  - Main content area: scrollable, padded
+
+StatusBadge component:
+  - Small pill with color + icon for each job status
+  - pending=gray, downloading=blue, processing=yellow/amber, ready=green, approved=teal, publishing=purple, published=cyan, failed=red
+
+JobPipeline component (used in Job Detail):
+  - Horizontal step tracker showing all 7 stages
+  - Each step: circular icon, label below, connecting line
+  - States: waiting (gray) / active (cyan pulsing) / complete (green checkmark) / error (red X)
+
+═══════════════════════════════════════════════════════════════
+AI CONTENT GENERATION (Gemini)
+═══════════════════════════════════════════════════════════════
+
+Model: gemini-2.0-flash
+Auth: API key from env (GEMINI_API_KEY or AI_INTEGRATIONS_GEMINI_API_KEY)
+Direct REST call to: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent
+
+Prompt for main content:
+  Given this video metadata, generate YouTube SEO content:
+  - Title: 70 chars max, clickable, includes keywords
+  - Description: 400–500 words, structured with sections, keywords naturally placed
+  - Tags: exactly 30 comma-separated tags, mix of broad + specific
+  - Hashtags: 10 hashtags for description footer
+
+AI Tools endpoints generate:
+  - Script: full narration script with intro/hook/body/CTA sections
+  - Hooks: 10 viral title variations in different styles (curiosity, shock, number, question, etc.)
+  - Translation: localize all fields to a target language
+  - Comment replies: 5 reply options in different tones (friendly, professional, witty)
+  - Chapters: timestamped chapter list from description content
+
+═══════════════════════════════════════════════════════════════
+YOUTUBE OAUTH FLOW
+═══════════════════════════════════════════════════════════════
+
+1. User goes to Settings, clicks "Connect YouTube Channel"
+2. Server redirects to Google OAuth2 with scopes: youtube.upload, youtube.readonly, youtube.force-ssl
+3. Google redirects back to /api/auth/youtube/callback with auth code
+4. Server exchanges code for access_token + refresh_token
+5. Calls YouTube API to get channel info (name, id, thumbnail, subscriber count)
+6. Saves token to api_tokens table, channel to channels table
+7. Redirects user to /channel hub page
+
+Token refresh: googleapis OAuth2Client handles refresh automatically on token expiry
+
+═══════════════════════════════════════════════════════════════
+VIDEO UPLOAD TO YOUTUBE
+═══════════════════════════════════════════════════════════════
+
+Uses googleapis youtube.videos.insert() with resumable upload
+- Reads the already-downloaded local file (job.videoPath) — does NOT re-download
+- Falls back to re-download with quality-constrained format selector if file is missing
+- Uploads thumbnail separately via yt.thumbnails.set() after video is live
+- Sanitizes title: strips < > and control chars, truncates to 100 chars (92 for Shorts)
+- Description: main text + hashtags block + tags block, max 5000 chars
+- YouTube Shorts: appends " #Shorts" to title, adds Shorts to tags
+
+═══════════════════════════════════════════════════════════════
+ENVIRONMENT VARIABLES (required)
+═══════════════════════════════════════════════════════════════
+
+DATABASE_URL         — PostgreSQL connection string
+GEMINI_API_KEY       — Google Gemini AI key (from https://aistudio.google.com/apikey)
+SESSION_SECRET       — Express session signing secret
+YOUTUBE_CLIENT_ID    — (can also be stored in app_config DB table via Settings page)
+YOUTUBE_CLIENT_SECRET — (can also be stored in app_config DB table via Settings page)
+
+═══════════════════════════════════════════════════════════════
+FILE STORAGE
+═══════════════════════════════════════════════════════════════
+
+All video files stored locally in: /home/runner/workspace/.video-store/
+  job-{id}-raw.mp4            — downloaded video (yt-dlp output)
+  job-{id}-processed.mp4      — FFmpeg-encoded output (4K Mission only)
+  job-{id}-ffmpeg.pid         — FFmpeg process ID (for survive-restart tracking)
+  job-{id}-ffmpeg-progress.txt — FFmpeg progress output (for live %)
+
+Cleanup scheduler runs daily at midnight:
+  - Deletes video files for published jobs (they've already been uploaded)
+  - Deletes orphaned files for jobs not in DB
+  - Clears videoPath column in DB for deleted files
+
+═══════════════════════════════════════════════════════════════
+MONOREPO STRUCTURE
+═══════════════════════════════════════════════════════════════
+
+workspace/
+├── artifacts/
+│   ├── api-server/          — Express backend
+│   │   └── src/
+│   │       ├── index.ts     — server entry, calls resumeStuckJobs() on startup
+│   │       ├── app.ts       — Express app setup, route mounting
+│   │       ├── routes/      — jobs, content, thumbnails, channels, tokens, stats, publish-logs, youtube-auth, youtube-api, ai-tools, settings, health
+│   │       └── lib/
+│   │           ├── video-processor.ts  — yt-dlp download + FFmpeg pipeline + resumeStuckJobs()
+│   │           ├── youtube-publisher.ts — YouTube upload via googleapis
+│   │           ├── ai-content.ts       — Gemini REST calls
+│   │           ├── cleanup-scheduler.ts — midnight file cleanup
+│   │           ├── app-config.ts       — reads/writes app_config table
+│   │           └── logger.ts           — pino logger
+│   └── n3xus/               — React + Vite frontend
+│       └── src/
+│           ├── main.tsx
+│           ├── App.tsx      — wouter Router + Layout wrapper
+│           ├── index.css    — Tailwind + Google Fonts imports
+│           ├── pages/       — dashboard, jobs, job-detail, new-job, 4k-mission, channel, discover, logs, settings
+│           └── components/  — Layout, StatusBadge, JobPipeline
+├── lib/
+│   ├── api-spec/
+│   │   └── openapi.yaml     — source of truth for all API contracts
+│   ├── api-zod/             — generated Zod schemas (via Orval)
+│   ├── api-client-react/    — generated React Query hooks (via Orval)
+│   └── db/
+│       └── src/schema/      — Drizzle ORM table definitions
+├── scripts/
+│   └── post-merge.sh        — installs yt-dlp via pip on environment reset
+└── pnpm-workspace.yaml
+
+═══════════════════════════════════════════════════════════════
+SPECIAL BEHAVIORS & GOTCHAS
+═══════════════════════════════════════════════════════════════
+
+1. yt-dlp must be installed via pip (not apt): pip install --user "yt-dlp>=2026.6.9"
+   Uses python3 -m yt_dlp as the command, with PYTHONPATH pointing to pip user site-packages.
+
+2. yt-dlp client rotation for anti-throttle:
+   Tries: android_vr (no cookies) → ios → web → tv_embedded in sequence.
+   Format selector includes height constraint to enforce chosen quality.
+
+3. FFmpeg detached process:
+   Spawned with detached:true + proc.unref() so server restart does NOT kill encode.
+   PID file written immediately after spawn for re-attach on next startup.
+
+4. Contract-first API:
+   Never write Zod validators or API hooks by hand.
+   Edit openapi.yaml → run: pnpm --filter @workspace/api-spec run codegen
+
+5. Google Fonts import MUST be the first line in index.css before @import "tailwindcss".
+
+6. Express 5 wildcard routes: use /{*splat} not *.
+
+7. After any route/lib file changes in api-server, always rebuild:
+   pnpm --filter @workspace/api-server run build && restart workflow.
+
+8. YouTube thumbnail upload can fail if channel is unverified — this is non-fatal,
+   the video is already live. Log the error and continue.
+
+9. Re-upload uses job.videoPath (existing file) not a fresh download.
+   Only re-downloads if file is missing, using quality-constrained format selector.
+
+10. 4K Mission jobs go through FFmpeg re-encode (fingerprint-breaking).
+    Normal Mission jobs skip FFmpeg — raw download is published directly.

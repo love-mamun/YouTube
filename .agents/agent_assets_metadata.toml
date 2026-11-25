@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "M5YNfEBBEvI2XL5SPUA8m"
+uri = "file://prompt.txt"
+type = "text"
+title = "N3XUS — Full App Prompt"
