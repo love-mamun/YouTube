@@ -339,6 +339,39 @@ function createMockDb(): DrizzleDb {
   return mockDb as unknown as DrizzleDb;
 }
 
+function sanitizeDatabaseUrl(raw: string): string {
+  let s = raw.trim();
+  if (!s) return "";
+
+  while (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    s = s.slice(1, -1).trim();
+  }
+
+  if (/^DATABASE_URL\s*=/i.test(s)) {
+    s = s.replace(/^DATABASE_URL\s*=\s*/i, "").trim();
+    while (
+      (s.startsWith('"') && s.endsWith('"')) ||
+      (s.startsWith("'") && s.endsWith("'"))
+    ) {
+      s = s.slice(1, -1).trim();
+    }
+  }
+
+  if (!/^(?:postgres|postgresql):\/\//i.test(s)) {
+    const pgMatch = s.match(/(?:postgres|postgresql):\/\/[^\s'"]+/i);
+    if (pgMatch) {
+      s = pgMatch[0];
+    } else if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s) && /@/.test(s)) {
+      s = `postgresql://${s}`;
+    }
+  }
+
+  return s;
+}
+
 function getSslConfig(connectionString: string): false | { rejectUnauthorized: false } {
   const lower = connectionString.toLowerCase();
   if (lower.includes("sslmode=disable")) return false;
@@ -353,10 +386,11 @@ function getSslConfig(connectionString: string): false | { rejectUnauthorized: f
 }
 
 function normalizePoolConfig(connectionString: string): pg.PoolConfig {
-  const ssl = getSslConfig(connectionString);
-  let normalizedUrl = connectionString;
+  const sanitized = sanitizeDatabaseUrl(connectionString);
+  const ssl = getSslConfig(sanitized);
+  let normalizedUrl = sanitized;
   try {
-    const parsed = new URL(connectionString);
+    const parsed = new URL(sanitized);
     const mode = parsed.searchParams.get("sslmode")?.toLowerCase();
     if (mode && mode !== "disable" && mode !== "verify-full") {
       parsed.searchParams.delete("sslmode");
@@ -460,9 +494,13 @@ const SCHEMA_STATEMENTS = [
 let pool: pg.Pool | null = null;
 let db: DrizzleDb;
 
-if (process.env.DATABASE_URL) {
+const sanitizedDatabaseUrl = process.env.DATABASE_URL
+  ? sanitizeDatabaseUrl(process.env.DATABASE_URL)
+  : "";
+
+if (sanitizedDatabaseUrl) {
   try {
-    pool = new Pool(normalizePoolConfig(process.env.DATABASE_URL));
+    pool = new Pool(normalizePoolConfig(sanitizedDatabaseUrl));
     pool.on("error", (error) => {
       console.error("[DB POOL ERROR]", error);
     });
