@@ -262,6 +262,7 @@ export async function publishToYouTube(
   const yt = await getYouTubeClient(options.channelId);
 
   let localPath: string | null = null;
+  let downloadedTempPath: string | null = null;
   let usedExistingFile = false;
   // Declared here (outside try) so the finally block can reference it safely.
   let shortsPath: string | null = null;
@@ -280,6 +281,7 @@ export async function publishToYouTube(
         jobId,
         signal: options.signal,
       });
+      downloadedTempPath = localPath;
     }
     if (!localPath) {
       throw new Error("Video file path missing before YouTube upload");
@@ -371,22 +373,32 @@ export async function publishToYouTube(
     options.signal?.addEventListener("abort", onParentAbort, { once: true });
 
     const uploadWatchdog = setInterval(() => {
-      if (Date.now() - lastByteAt >= 120_000) {
+      const limitMs = uploadedBytes >= totalBytes ? 300_000 : 180_000;
+      if (Date.now() - lastByteAt >= limitMs) {
         stalledOut = true;
-        uploadAbort.abort(new Error("YouTube upload stalled with no bytes sent for 120s"));
+        uploadAbort.abort(new Error("YouTube upload stalled with no progress"));
       }
     }, 5_000);
 
+    // IMPORTANT: Do NOT attach mediaStream.on("data", ...) here! Attaching a data
+    // listener switches ReadStream to flowing mode and drains the file before
+    // yt.videos.insert finishes OAuth/resumable setup. Use googleapis onUploadProgress.
     const mediaStream = createReadStream(localPath);
-    mediaStream.on("data", (chunk: Buffer | string) => {
-      lastByteAt = Date.now();
-      uploadedBytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
-      const pct = Math.min(100, (uploadedBytes / totalBytes) * 100);
-      void updateJobProgressThrottled(jobId, 90 + (pct / 100) * 9, uploadProgState);
-    });
 
     let response;
     try {
+      const insertOpts = {
+        signal: uploadAbort.signal,
+        onUploadProgress: (evt: { bytesRead?: number }) => {
+          lastByteAt = Date.now();
+          if (typeof evt?.bytesRead === "number") {
+            uploadedBytes = evt.bytesRead;
+            const pct = Math.min(100, (uploadedBytes / totalBytes) * 100);
+            void updateJobProgressThrottled(jobId, 90 + (pct / 100) * 9, uploadProgState);
+          }
+        },
+      } as Parameters<typeof yt.videos.insert>[1];
+
       response = await yt.videos.insert(
         {
           part: ["snippet", "status"],
@@ -408,7 +420,7 @@ export async function publishToYouTube(
             body: mediaStream,
           },
         },
-        { signal: uploadAbort.signal }
+        insertOpts
       );
     } catch (uploadErr) {
       mediaStream.destroy();
@@ -416,7 +428,7 @@ export async function publishToYouTube(
         throw new Error("[CANCELLED] Stopped by user");
       }
       if (stalledOut) {
-        throw new Error("[UPLOAD_TIMEOUT] YouTube upload stalled (no progress for 2 minutes). Click Publish Now to retry.");
+        throw new Error("[UPLOAD_TIMEOUT] YouTube upload stalled (no progress for 3 minutes). Click Publish Now to retry.");
       }
       throw uploadErr;
     } finally {
@@ -490,10 +502,10 @@ export async function publishToYouTube(
     if (shortsPath && existsSync(shortsPath)) {
       await unlink(shortsPath).catch(() => {});
     }
-    // Only delete the file if we downloaded it ourselves as a temp copy.
-    // Never delete the stored job file (job.videoPath) — the user may still need it.
-    if (localPath && localPath !== shortsPath && !usedExistingFile && existsSync(localPath)) {
-      await unlink(localPath).catch(() => {});
+    // Clean up any temporary publish-time download (including when Shorts cropped it)
+    const tempToDelete = downloadedTempPath || (!usedExistingFile && localPath !== shortsPath ? localPath : null);
+    if (tempToDelete && existsSync(tempToDelete)) {
+      await unlink(tempToDelete).catch(() => {});
     }
   }
 }

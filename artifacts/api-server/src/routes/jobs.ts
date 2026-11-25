@@ -46,7 +46,7 @@ router.post("/jobs", async (req, res): Promise<void> => {
     return;
   }
 
-  const { youtubeUrl, publishMode, platforms, scheduledAt, quality, missionType } = parsed.data;
+  const { youtubeUrl, publishMode, platforms, scheduledAt, quality, codec, missionType } = parsed.data;
 
   const [job] = await db
     .insert(videoJobsTable)
@@ -56,6 +56,7 @@ router.post("/jobs", async (req, res): Promise<void> => {
       platforms: platforms || "youtube",
       scheduledAt: scheduledAt ?? null,
       quality: quality ?? null,
+      codec: codec ?? null,
       missionType: missionType ?? "normal",
       status: "pending",
       progress: 0,

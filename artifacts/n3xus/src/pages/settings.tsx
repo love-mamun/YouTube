@@ -155,9 +155,10 @@ function ChannelCard({ ch, onSetDefault, onDisconnect, isSettingDefault, isDisco
 }
 
 export default function Settings() {
-  const queryClient = useQueryClient();
-  const { data: tokens } = useListTokens({ query: { queryKey: getListTokensQueryKey() } });
-  const { data: channels } = useListChannels({ query: { queryKey: getListChannelsQueryKey() } });
+  const [authed, setAuthed] = useState(false);
+  const [authChecking, setAuthChecking] = useState(true);
+  const { data: tokens } = useListTokens({ query: { queryKey: getListTokensQueryKey(), enabled: authed } });
+  const { data: channels } = useListChannels({ query: { queryKey: getListChannelsQueryKey(), enabled: authed } });
   const safeTokens = Array.isArray(tokens) ? tokens : [];
   const safeChannels = Array.isArray(channels) ? channels : [];
 
@@ -238,9 +239,8 @@ export default function Settings() {
   const [logoOk, setLogoOk] = useState(false);
   const [logoError, setLogoError] = useState<string | null>(null);
 
+  const queryClient = useQueryClient();
   // ── Auth gate ─────────────────────────────────────────────────────────────
-  const [authed, setAuthed] = useState(false);
-  const [authChecking, setAuthChecking] = useState(true);
   const [authPassword, setAuthPassword] = useState("");
   const [showAuthPassword, setShowAuthPassword] = useState(false);
   const [loginLoading, setLoginLoading] = useState(false);
@@ -452,23 +452,21 @@ export default function Settings() {
   };
 
   useEffect(() => {
-    if (authed) {
-      fetchProxyStatus();
-      fetchCookiesStatus();
-    }
-  }, [authed]);
-
-  useEffect(() => {
+    if (!authed) return;
     fetchYtChannels();
     fetchFbPages();
     fetchCredStatus();
     fetchCookiesStatus();
+    fetchProxyStatus();
     fetchLogoStatus();
+  }, [authed]);
+
+  useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const oauth = params.get("oauth");
     if (oauth === "youtube_connected") {
       window.history.replaceState({}, "", window.location.pathname);
-      fetchYtChannels();
+      if (authed) fetchYtChannels();
       queryClient.invalidateQueries({ queryKey: getListTokensQueryKey() });
       queryClient.invalidateQueries({ queryKey: getListChannelsQueryKey() });
     } else if (oauth === "youtube_error") {
@@ -483,7 +481,7 @@ export default function Settings() {
       const pages = params.get("pages");
       window.history.replaceState({}, "", window.location.pathname);
       setFbOauthMsg({ type: "success", text: `Facebook connected — ${pages ?? "1"} page${pages === "1" ? "" : "s"} imported.` });
-      fetchFbPages();
+      if (authed) fetchFbPages();
       queryClient.invalidateQueries({ queryKey: getListTokensQueryKey() });
       queryClient.invalidateQueries({ queryKey: getListChannelsQueryKey() });
     } else if (oauth === "facebook_error") {
@@ -493,7 +491,7 @@ export default function Settings() {
       window.history.replaceState({}, "", window.location.pathname);
       setFbOauthMsg({ type: "no_pages", text: "Logged in to Facebook but no managed Pages were found. Make sure you are an admin of at least one Facebook Page." });
     }
-  }, [queryClient]);
+  }, [queryClient, authed]);
 
   const handleSaveCredentials = async () => {
     const nonEmpty = Object.fromEntries(Object.entries(credValues).filter(([, v]) => v.trim() !== ""));
@@ -860,7 +858,7 @@ export default function Settings() {
                   )}
                   <span>
                     {cookiesStatus.validation
-                      ? `${cookiesStatus.validation.ytCookieCount} YouTube/Google cookies (${cookiesStatus.validation.foundAuthCookies.length} auth keys)`
+                      ? `${cookiesStatus.validation.ytCookieCount ?? 0} YouTube/Google cookies (${(cookiesStatus.validation.foundAuthCookies ?? []).length} auth keys)`
                       : "Cookie file saved"}
                   </span>
                   {cookiesStatus.updatedAt && (
@@ -875,12 +873,12 @@ export default function Settings() {
               {cookiesStatus.validation?.earliestExpiry && (
                 <p className="text-[11px] font-mono text-muted-foreground">
                   Earliest auth expiry: {new Date(cookiesStatus.validation.earliestExpiry).toLocaleDateString()}
-                  {cookiesStatus.validation.foundAuthCookies.length > 0 && (
-                    <> · Keys: {cookiesStatus.validation.foundAuthCookies.slice(0, 5).join(", ")}</>
+                  {(cookiesStatus.validation.foundAuthCookies ?? []).length > 0 && (
+                    <> · Keys: {(cookiesStatus.validation.foundAuthCookies ?? []).slice(0, 5).join(", ")}</>
                   )}
                 </p>
               )}
-              {cookiesStatus.validation?.warnings.map((w, idx) => (
+              {(cookiesStatus.validation?.warnings ?? []).map((w, idx) => (
                 <p key={idx} className="text-[11px] font-mono text-amber-400">{w}</p>
               ))}
             </div>

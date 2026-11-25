@@ -138,8 +138,22 @@ if (process.env.VITE_DEV_PROXY === "true") {
 
   if (existsSync(frontendDir)) {
     logger.info({ frontendDir }, "Serving frontend static files");
-    app.use(express.static(frontendDir));
+    app.use(
+      express.static(frontendDir, {
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith(".html")) {
+            res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+          } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+          }
+        },
+      }),
+    );
+    app.use("/assets", (_req, res) => {
+      res.status(404).type("text/plain").send("Asset not found");
+    });
     app.get("/{*splat}", (_req, res) => {
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
       res.sendFile(path.join(frontendDir, "index.html"));
     });
   } else {

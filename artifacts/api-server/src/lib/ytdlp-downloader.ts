@@ -75,8 +75,9 @@ function buildStrategies(hasCookies: boolean, hasPot: boolean): ClientStrategy[]
   if (hasPot && hasCookies) {
     return [
       { client: "web", useCookies: true, usePot: true, useMissingPotFlag: false },
-      { client: "mweb", useCookies: true, usePot: true, useMissingPotFlag: false },
       { client: "tv_embedded", useCookies: true, usePot: true, useMissingPotFlag: false },
+      { client: "mweb", useCookies: true, usePot: true, useMissingPotFlag: false },
+      { client: "web", useCookies: false, usePot: true, useMissingPotFlag: false },
       { client: "android_vr", useCookies: false, usePot: false, useMissingPotFlag: true },
     ];
   }
@@ -88,7 +89,7 @@ function buildStrategies(hasCookies: boolean, hasPot: boolean): ClientStrategy[]
     ];
   }
   if (!hasPot && hasCookies) {
-    // Without PO token server, android_vr & tv_embedded avoid web SABR stalls
+    // Without PO token server, tv_embedded & android_vr avoid web SABR stalls
     return [
       { client: "tv_embedded", useCookies: true, usePot: false, useMissingPotFlag: true },
       { client: "android_vr", useCookies: false, usePot: false, useMissingPotFlag: true },
@@ -252,7 +253,14 @@ function spawnYtDlpRaw(
         resolve({ stdout, stderr });
         return;
       }
-      reject(new Error(stderr.slice(-800) || `yt-dlp exited with code ${code}`));
+      const errorLines = stderr
+        .split(/\r?\n/)
+        .filter((l) => /^ERROR:/i.test(l.trim()));
+      const conciseErr =
+        errorLines.length > 0
+          ? errorLines.join(" ").slice(-800)
+          : stderr.slice(-800);
+      reject(new Error(conciseErr || `yt-dlp exited with code ${code}`));
     });
 
     proc.on("error", (err) => {
@@ -459,7 +467,9 @@ export async function downloadVideoWithResilience(options: {
               "--extractor-args", extractorVal,
               ...(strat.usePot ? pot.extractorArgs : []),
               ...(strat.useCookies && cookieCopy.path
-                ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
+                ? strat.client === "web"
+                  ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
+                  : ["--cookies", cookieCopy.path]
                 : []),
               ...commonArgs,
               url,
@@ -553,7 +563,7 @@ export async function downloadVideoWithResilience(options: {
             }
           }
 
-          if (/Sign in to confirm you.?re not a bot|cookies are no longer valid/i.test(lastError)) {
+          if (/Sign in to confirm you.?re not a bot|cookies are no longer valid|do-i-pass-cookies-to-yt-dlp/i.test(lastError)) {
             botCheckHit = true;
           }
 
@@ -577,7 +587,7 @@ export async function downloadVideoWithResilience(options: {
     const prioritizedError =
       rateLimitHits > 0 && !/429|Too Many Requests/i.test(lastError)
         ? `HTTP Error 429: Too Many Requests (${lastError})`
-        : botCheckHit && !/not a bot/i.test(lastError)
+        : botCheckHit && !/not a bot|do-i-pass-cookies-to-yt-dlp/i.test(lastError)
         ? `Sign in to confirm you're not a bot (${lastError})`
         : formatMiss4KHit && isStrict4K && !/4K_UNAVAILABLE/i.test(lastError)
         ? `Requested format is not available for 2160p (${lastError})`

@@ -541,23 +541,6 @@ export function classifyYtDlpError(
     };
   }
 
-  if (/stalled|timed out|TransportError/i.test(msg)) {
-    if (context?.usedProxy) {
-      return {
-        code: "PROXY_ERROR",
-        formattedMessage: `[PROXY_ERROR] Connection to YouTube timed out via your configured proxy${context.proxyMaskedHost ? ` (${context.proxyMaskedHost})` : ""}. Test or remove the slow/offline proxy in Settings and retry. (${msg.slice(-200)})`,
-      };
-    }
-    const isApiTimeout = /Unable to download API page|TransportError/i.test(msg);
-    const qualLabel = context?.quality ? context.quality : "standard";
-    return {
-      code: "STREAM_STALLED",
-      formattedMessage: isApiTimeout
-        ? `[STREAM_STALLED] YouTube API connection timed out (${qualLabel}). Check Settings → Test Download Setup or try a working proxy/cookies. (${msg.slice(-200)})`
-        : `[STREAM_STALLED] YouTube download stalled or timed out on this connection (${qualLabel}). Try again, choose a lower quality, or configure a faster proxy in Settings. (${msg.slice(-200)})`,
-    };
-  }
-
   if (/429|Too Many Requests/i.test(msg)) {
     return {
       code: "RATE_LIMITED_429",
@@ -565,7 +548,7 @@ export function classifyYtDlpError(
     };
   }
 
-  if (/Sign in to confirm you.?re not a bot|cookies are no longer valid|confirm you are not a bot/i.test(msg)) {
+  if (/Sign in to confirm you.?re not a bot|cookies are no longer valid|confirm you are not a bot|do-i-pass-cookies-to-yt-dlp|exporting-youtube-cookies/i.test(msg)) {
     if (context?.usedCookies) {
       return {
         code: "COOKIES_EXPIRED",
@@ -587,7 +570,7 @@ export function classifyYtDlpError(
     }
     return {
       code: "FORMAT_UNAVAILABLE",
-      formattedMessage: `[FORMAT_UNAVAILABLE] Requested video quality (${context?.quality ?? "auto"}) is unavailable on YouTube for this client/session. (${msg.slice(-220)})`,
+      formattedMessage: `[FORMAT_UNAVAILABLE] Requested video quality (${context?.quality ?? "standard"}) is unavailable on YouTube for this client/session. (${msg.slice(-220)})`,
     };
   }
 
@@ -595,6 +578,23 @@ export function classifyYtDlpError(
     return {
       code: "POT_UNAVAILABLE",
       formattedMessage: `[POT_UNAVAILABLE] PO Token provider failed to generate a token for YouTube. (${msg.slice(-220)})`,
+    };
+  }
+
+  if (/stalled|timed out|TransportError/i.test(msg)) {
+    if (context?.usedProxy) {
+      return {
+        code: "PROXY_ERROR",
+        formattedMessage: `[PROXY_ERROR] Connection to YouTube timed out via your configured proxy${context.proxyMaskedHost ? ` (${context.proxyMaskedHost})` : ""}. Test or remove the slow/offline proxy in Settings and retry. (${msg.slice(-200)})`,
+      };
+    }
+    const isApiTimeout = /Unable to download API page|TransportError/i.test(msg);
+    const qualLabel = context?.quality ? context.quality : "standard";
+    return {
+      code: "STREAM_STALLED",
+      formattedMessage: isApiTimeout
+        ? `[STREAM_STALLED] YouTube API connection timed out (${qualLabel}). Check Settings → Test Download Setup or try a working proxy/cookies. (${msg.slice(-200)})`
+        : `[STREAM_STALLED] YouTube download stalled or timed out on this connection (${qualLabel}). Try again, choose a lower quality, or configure a faster proxy in Settings. (${msg.slice(-200)})`,
     };
   }
 

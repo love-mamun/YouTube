@@ -236,7 +236,7 @@ export default function NewJob() {
         else navigate("/jobs");
       }
     },
-    [canSubmit, validUrls, publishMode, platforms, scheduledAt, createJob, queryClient, navigate]
+    [canSubmit, validUrls, quality, codec, publishMode, platforms, scheduledAt, createJob, queryClient, navigate]
   );
 
   const completedCount = urls.filter((u) => u.status === "done").length;

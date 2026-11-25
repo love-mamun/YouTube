@@ -20,7 +20,7 @@ export interface ParsedJobDiagnostic {
 }
 
 export function previewNetscapeCookiesClient(raw: string): CookieValidationSummary | null {
-  if (!raw.trim()) return null;
+  if (typeof raw !== "string" || !raw.trim()) return null;
 
   const CORE_SESSION = ["SID", "__Secure-1PSID", "__Secure-3PSID", "SAPISID", "LOGIN_INFO"];
   const RECOMMENDED = [
@@ -136,8 +136,8 @@ export function previewNetscapeCookiesClient(raw: string): CookieValidationSumma
 }
 
 export function parseJobErrorDiagnostic(errorMessage: string): ParsedJobDiagnostic {
-  const msg = errorMessage.trim();
-  const codeMatch = msg.match(/^\[([A-Z0-9_]+)\]\s*(.*)$/s);
+  const msg = typeof errorMessage === "string" ? errorMessage.trim() : String(errorMessage ?? "").trim();
+  const codeMatch = msg.match(/^\[([A-Z0-9_]+)\]\s*([\s\S]*)$/);
   const explicitCode = codeMatch?.[1] ?? "";
   const cleanMsg = codeMatch?.[2] ?? msg;
 
@@ -147,7 +147,7 @@ export function parseJobErrorDiagnostic(errorMessage: string): ParsedJobDiagnost
       ? "RATE_LIMITED_429"
       : /cookies are no longer valid/i.test(msg)
       ? "COOKIES_EXPIRED"
-      : /not a bot/i.test(msg)
+      : /not a bot|do-i-pass-cookies-to-yt-dlp|exporting-youtube-cookies/i.test(msg)
       ? "BOT_CHECK"
       : /2160p|4K/i.test(msg) && /not available|aborted/i.test(msg)
       ? "4K_UNAVAILABLE"
