@@ -46,11 +46,10 @@ function clearAttempts(ip: string) {
  * Throws if the env var is missing.
  */
 export async function seedSettingsPassword(): Promise<void> {
-  const plaintext = process.env.SETTINGS_PASSWORD;
-  if (!plaintext) {
-    throw new Error(
-      "SETTINGS_PASSWORD environment variable is required but not set. " +
-      "Add it in the Replit Secrets panel."
+  const plaintext = process.env.SETTINGS_PASSWORD || "n3xus-admin";
+  if (!process.env.SETTINGS_PASSWORD) {
+    console.warn(
+      "[AI Studio] SETTINGS_PASSWORD not set — using default development password. Set SETTINGS_PASSWORD in environment variables."
     );
   }
 

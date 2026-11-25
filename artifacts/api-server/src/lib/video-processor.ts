@@ -1,6 +1,8 @@
 import { exec, spawn, execSync } from "child_process";
 import { promisify } from "util";
 import { mkdirSync, existsSync, unlinkSync, writeFileSync, readFileSync, statSync } from "fs";
+import * as os from "os";
+import * as path from "path";
 import { eq, and, inArray } from "drizzle-orm";
 import { db, videoJobsTable, thumbnailsTable, publishLogsTable, apiTokensTable, appConfigTable } from "@workspace/db";
 import { publishToYouTube, updatePublishLog } from "./youtube-publisher";
@@ -10,8 +12,8 @@ import { logger } from "./logger";
 const execAsync = promisify(exec);
 
 const FONT_FILE = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
-const VIDEO_TMP_DIR = "/home/runner/workspace/.video-store";
-const LOGO_PATH = "/home/runner/workspace/artifacts/api-server/assets/watermark-logo.png";
+const VIDEO_TMP_DIR = path.join(os.tmpdir(), "n3xus-video-store");
+const LOGO_PATH = path.resolve(process.cwd(), "artifacts/api-server/assets/watermark-logo.png");
 
 // Resolution → { scale, bitrate } for the FFmpeg pipeline
 // 4K uses 35 Mbps — matching YouTube's recommended encoding for 2160p SDR content.
@@ -166,18 +168,14 @@ const YT_COOKIES_PATH = "/tmp/n3xus-yt-cookies.txt";
 // can list/download all resolutions from 480p up to 4K without needing a JS
 // runtime or PO Token. PYTHONPATH override makes python3 load this version.
 const YTDLP_PYTHONPATH = "/home/runner/workspace/.pythonlibs/lib/python3.12/site-packages";
-const YTDLP_ENV = { ...process.env, PYTHONPATH: YTDLP_PYTHONPATH };
+const YTDLP_ENV = existsSync(YTDLP_PYTHONPATH)
+  ? { ...process.env, PYTHONPATH: YTDLP_PYTHONPATH }
+  : { ...process.env };
 
-// Use process.execPath — always the real Node binary path inside this running process.
-// This is more reliable than spawning a subprocess to find it.
 const NODE_BIN = process.execPath ?? "node";
 const JS_RUNTIME_ARGS = ["--js-runtimes", `node:${NODE_BIN}`];
 
-// ── PO Token via bgutil script (no server needed) ───────────────────────────
-// bgutil-ytdlp-pot-provider plugin is installed in .pythonlibs so yt-dlp picks
-// it up automatically via PYTHONPATH. The plugin looks for generate_once.js at
-// BGUTIL_SERVER_HOME/build/generate_once.js.
-const BGUTIL_SERVER_HOME = "/home/runner/workspace/bgutil-ytdlp-pot-provider/server";
+const BGUTIL_SERVER_HOME = path.resolve(process.cwd(), "bgutil-ytdlp-pot-provider/server");
 const BGUTIL_SCRIPT = `${BGUTIL_SERVER_HOME}/build/generate_once.js`;
 
 // Returns extractor-args to activate bgutil PO token if the script is built.

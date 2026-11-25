@@ -18,9 +18,9 @@ async function getOAuthClient() {
 
   const domains = process.env.REPLIT_DOMAINS?.split(",") ?? [];
   const primaryDomain = domains[0];
-  const redirectBase = primaryDomain
-    ? `https://${primaryDomain}`
-    : "http://localhost:80";
+  const redirectBase =
+    process.env.APP_URL ||
+    (primaryDomain ? `https://${primaryDomain}` : "http://localhost:3000");
 
   return new google.auth.OAuth2(
     clientId,

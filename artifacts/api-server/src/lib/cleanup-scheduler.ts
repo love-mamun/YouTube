@@ -1,10 +1,11 @@
-import { readdirSync, statSync, unlinkSync } from "fs";
-import { existsSync } from "fs";
+import { readdirSync, statSync, unlinkSync, existsSync } from "fs";
+import * as os from "os";
+import * as path from "path";
 import { eq, isNotNull } from "drizzle-orm";
 import { db, videoJobsTable } from "@workspace/db";
 import { logger } from "./logger";
 
-const VIDEO_TMP_DIR = "/home/runner/workspace/.video-store";
+const VIDEO_TMP_DIR = path.join(os.tmpdir(), "n3xus-video-store");
 // Files deleted at midnight regardless of age
 
 async function runCleanup() {

@@ -1,1 +1,0 @@
-{"version":3,"file":"jobStatus.d.ts","sourceRoot":"","sources":["../../../src/generated/types/jobStatus.ts"],"names":[],"mappings":"AAAA;;;;;;GAMG;AAEH,MAAM,WAAW,SAAS;IACxB,EAAE,EAAE,MAAM,CAAC;IACX,MAAM,EAAE,MAAM,CAAC;IACf,QAAQ,EAAE,MAAM,CAAC;IACjB,gBAAgB;IAChB,WAAW,CAAC,EAAE,MAAM,GAAG,IAAI,CAAC;IAC5B,gBAAgB;IAChB,YAAY,CAAC,EAAE,MAAM,GAAG,IAAI,CAAC;CAC9B"}

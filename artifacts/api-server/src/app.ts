@@ -29,23 +29,26 @@ app.use(
     },
   }),
 );
-// Restrict CORS to the known frontend origin(s).
-// In dev the Vite proxy forwards /api, so the browser never hits port 8080
-// directly — but we still lock down origins defensively.
+app.set("trust proxy", 1);
+
 const allowedOrigins = [
-  // Replit proxied preview (set by the platform)
   ...(process.env.REPLIT_DEV_DOMAIN
     ? [`https://${process.env.REPLIT_DEV_DOMAIN}`]
     : []),
-  // Local dev fallback
+  ...(process.env.APP_URL ? [process.env.APP_URL] : []),
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
   "http://localhost:5000",
   "http://localhost:3001",
 ];
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow server-to-server requests (no Origin header) and listed origins
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (
+        !origin ||
+        allowedOrigins.includes(origin) ||
+        /^https:\/\/[a-z0-9.-]+\.run\.app$/i.test(origin)
+      ) {
         callback(null, true);
       } else {
         callback(new Error(`CORS: origin not allowed — ${origin}`));
@@ -58,10 +61,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Session — used for settings auth gate
-const sessionSecret = process.env.SESSION_SECRET;
-if (!sessionSecret) {
-  throw new Error("SESSION_SECRET environment variable is required but not set.");
-}
+const sessionSecret =
+  process.env.SESSION_SECRET || "n3xus-dev-session-secret-change-in-production";
 app.use(
   session({
     secret: sessionSecret,
@@ -69,7 +70,7 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: "auto",
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
       sameSite: "lax",
     },
@@ -78,13 +79,31 @@ app.use(
 
 app.use("/api", router);
 
-// Serve watermark logo and other assets so the frontend can preview them
-app.use("/api/assets", express.static("/home/runner/workspace/artifacts/api-server/assets"));
+const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
+const assetsDir = existsSync(path.resolve(process.cwd(), "artifacts/api-server/assets"))
+  ? path.resolve(process.cwd(), "artifacts/api-server/assets")
+  : path.resolve(__dirname, "..", "assets");
 
-if (process.env.NODE_ENV === "production") {
-  // Production: serve the built Vite frontend
-  const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-  const frontendDir = path.resolve(__dirname, "..", "..", "n3xus", "dist", "public");
+// Serve watermark logo and other assets so the frontend can preview them
+app.use("/api/assets", express.static(assetsDir));
+
+if (process.env.VITE_DEV_PROXY === "true") {
+  // Optional dev proxy to separate Vite server
+  const { createProxyMiddleware } = await import("http-proxy-middleware");
+  const vitePort = process.env.VITE_PORT || "5000";
+  const viteProxy = createProxyMiddleware({
+    target: `http://localhost:${vitePort}`,
+    changeOrigin: true,
+    ws: true,
+    logger: console,
+  });
+  app.use(viteProxy);
+} else {
+  const candidates = [
+    path.resolve(process.cwd(), "artifacts/n3xus/dist/public"),
+    path.resolve(__dirname, "..", "..", "n3xus", "dist", "public"),
+  ];
+  const frontendDir = candidates.find((dir) => existsSync(dir)) ?? candidates[0];
 
   if (existsSync(frontendDir)) {
     logger.info({ frontendDir }, "Serving frontend static files");
@@ -95,17 +114,6 @@ if (process.env.NODE_ENV === "production") {
   } else {
     logger.warn({ frontendDir }, "Frontend dist not found — skipping static serving");
   }
-} else {
-  // Development: proxy everything non-API to the Vite dev server
-  const { createProxyMiddleware } = await import("http-proxy-middleware");
-  const vitePort = process.env.VITE_PORT || "5000";
-  const viteProxy = createProxyMiddleware({
-    target: `http://localhost:${vitePort}`,
-    changeOrigin: true,
-    ws: true,
-    logger: console,
-  });
-  app.use(viteProxy);
 }
 
 export default app;

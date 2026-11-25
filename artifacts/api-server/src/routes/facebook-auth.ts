@@ -12,9 +12,10 @@ function getRedirectUri(origin: string) {
 }
 
 function getOrigin() {
+  if (process.env.APP_URL) return process.env.APP_URL;
   const domains = process.env.REPLIT_DOMAINS?.split(",") ?? [];
   const primary = domains[0];
-  return primary ? `https://${primary}` : "http://localhost:80";
+  return primary ? `https://${primary}` : "http://localhost:3000";
 }
 
 // ── Step 1: Start Facebook OAuth ─────────────────────────────────────────────

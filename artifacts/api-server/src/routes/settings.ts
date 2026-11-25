@@ -2,11 +2,12 @@ import { Router, type IRouter } from "express";
 import { eq } from "drizzle-orm";
 import { writeFileSync, existsSync, unlinkSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
+import * as path from "path";
 import { db, appConfigTable } from "@workspace/db";
 
-const LOGO_FILE_PATH = "/home/runner/workspace/artifacts/api-server/assets/watermark-logo.png";
+const ASSETS_DIR     = path.resolve(process.cwd(), "artifacts/api-server/assets");
+const LOGO_FILE_PATH = path.join(ASSETS_DIR, "watermark-logo.png");
 const LOGO_TMP_PATH  = "/tmp/watermark-upload-raw";
-const ASSETS_DIR     = "/home/runner/workspace/artifacts/api-server/assets";
 
 const router: IRouter = Router();
 
