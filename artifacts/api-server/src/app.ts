@@ -36,25 +36,38 @@ const allowedOrigins = [
     ? [`https://${process.env.REPLIT_DEV_DOMAIN}`]
     : []),
   ...(process.env.APP_URL ? [process.env.APP_URL] : []),
+  ...(process.env.RENDER_EXTERNAL_URL ? [process.env.RENDER_EXTERNAL_URL] : []),
   "http://localhost:3000",
   "http://127.0.0.1:3000",
   "http://localhost:5000",
   "http://localhost:3001",
 ];
 app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (
-        !origin ||
-        allowedOrigins.includes(origin) ||
-        /^https:\/\/[a-z0-9.-]+\.run\.app$/i.test(origin)
-      ) {
-        callback(null, true);
-      } else {
-        callback(new Error(`CORS: origin not allowed — ${origin}`));
-      }
-    },
-    credentials: true,
+  cors((req, callback) => {
+    const origin = req.header("Origin");
+    const host = req.header("X-Forwarded-Host") || req.header("Host");
+    const proto =
+      (req.header("X-Forwarded-Proto") || req.protocol || "https")
+        .split(",")[0]
+        .trim();
+    const isSameOrigin = Boolean(
+      origin &&
+        host &&
+        (origin === `${proto}://${host}` ||
+          origin === `https://${host}` ||
+          origin === `http://${host}`),
+    );
+
+    if (
+      !origin ||
+      isSameOrigin ||
+      allowedOrigins.includes(origin) ||
+      /^https:\/\/[a-z0-9.-]+\.(?:run\.app|onrender\.com)$/i.test(origin)
+    ) {
+      callback(null, { origin: true, credentials: true });
+    } else {
+      callback(new Error(`CORS: origin not allowed — ${origin}`));
+    }
   }),
 );
 app.use(express.json());

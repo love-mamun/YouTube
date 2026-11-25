@@ -20,6 +20,7 @@ async function getOAuthClient() {
   const primaryDomain = domains[0];
   const redirectBase =
     process.env.APP_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
     (primaryDomain ? `https://${primaryDomain}` : "http://localhost:3000");
 
   return new google.auth.OAuth2(

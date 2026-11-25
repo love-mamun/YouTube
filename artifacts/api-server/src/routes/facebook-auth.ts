@@ -13,6 +13,7 @@ function getRedirectUri(origin: string) {
 
 function getOrigin() {
   if (process.env.APP_URL) return process.env.APP_URL;
+  if (process.env.RENDER_EXTERNAL_URL) return process.env.RENDER_EXTERNAL_URL;
   const domains = process.env.REPLIT_DOMAINS?.split(",") ?? [];
   const primary = domains[0];
   return primary ? `https://${primary}` : "http://localhost:3000";
