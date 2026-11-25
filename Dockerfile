@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --break-system-packages --no-cache-dir yt-dlp
 
-RUN corepack enable && corepack prepare pnpm@10 --activate
+RUN npm install -g pnpm@10.23.0
 WORKDIR /app
 COPY . .
 RUN pnpm install --frozen-lockfile --prod=false \
