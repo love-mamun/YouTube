@@ -18,4 +18,4 @@ RUN pnpm install --frozen-lockfile --prod=false \
 ENV NODE_ENV=production \
     PORT=10000
 EXPOSE 10000
-CMD ["./start.sh"]
+CMD ["sh", "./start.sh"]
