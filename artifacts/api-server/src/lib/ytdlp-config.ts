@@ -8,6 +8,7 @@ import { logger } from "./logger";
 
 export const YT_COOKIES_DB_KEY = "yt_cookies";
 export const YT_PROXY_DB_KEY = "YTDLP_PROXY_URL";
+export const YT_PROXY_AUTOPRUNE_DB_KEY = "yt_proxy_autoprune";
 export const YT_COOKIES_PATH = "/tmp/n3xus-yt-cookies.txt";
 export const POT_HTTP_URL = process.env.BGUTIL_POT_URL || "http://127.0.0.1:4416";
 
@@ -470,6 +471,91 @@ export function parseAndValidateProxyList(
   return { ok: true, proxies, maskedList, summary };
 }
 
+export function getPublicTemplateEntry(raw: string): string | null {
+  try {
+    const candidate = raw.includes("://") ? raw : `http://${raw}`;
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== "http:" || parsed.username || parsed.password || !parsed.port) {
+      return null;
+    }
+    return `${parsed.hostname}:${parsed.port}`;
+  } catch {
+    return null;
+  }
+}
+
+export async function getProxyAutoPruneEnabled(): Promise<boolean> {
+  try {
+    const [row] = await db
+      .select({ value: appConfigTable.value })
+      .from(appConfigTable)
+      .where(eq(appConfigTable.key, YT_PROXY_AUTOPRUNE_DB_KEY))
+      .limit(1);
+    return row?.value === "true";
+  } catch {
+    return false;
+  }
+}
+
+export async function setProxyAutoPruneEnabled(enabled: boolean): Promise<void> {
+  const value = enabled ? "true" : "false";
+  await db
+    .insert(appConfigTable)
+    .values({ key: YT_PROXY_AUTOPRUNE_DB_KEY, value })
+    .onConflictDoUpdate({
+      target: appConfigTable.key,
+      set: { value, updatedAt: new Date() },
+    });
+}
+
+export async function saveStoredProxyList(proxies: string[]): Promise<void> {
+  if (proxies.length === 0) {
+    await db.delete(appConfigTable).where(eq(appConfigTable.key, YT_PROXY_DB_KEY));
+    return;
+  }
+  const storedValue = proxies.join("\n");
+  await db
+    .insert(appConfigTable)
+    .values({ key: YT_PROXY_DB_KEY, value: storedValue })
+    .onConflictDoUpdate({
+      target: appConfigTable.key,
+      set: { value: storedValue, updatedAt: new Date() },
+    });
+}
+
+export async function removeProxyFromStoredPool(
+  target: string | { index?: number; maskedHost?: string }
+): Promise<{ removed: boolean; remainingCount: number }> {
+  const current = await getStoredProxyList();
+  if (current.length === 0) {
+    return { removed: false, remainingCount: 0 };
+  }
+
+  let next: string[];
+  if (typeof target === "object") {
+    if (typeof target.index === "number" && target.index >= 0 && target.index < current.length) {
+      next = current.filter((_, i) => i !== target.index);
+    } else if (target.maskedHost) {
+      const idx = current.findIndex((p) => maskProxyUrl(p) === target.maskedHost);
+      next = idx >= 0 ? current.filter((_, i) => i !== idx) : current;
+    } else {
+      next = current;
+    }
+  } else {
+    const normalizedTarget = target.trim().replace(/\/+$/, "");
+    next = current.filter(
+      (p) => p !== normalizedTarget && maskProxyUrl(p) !== normalizedTarget
+    );
+  }
+
+  if (next.length === current.length) {
+    return { removed: false, remainingCount: current.length };
+  }
+
+  await saveStoredProxyList(next);
+  return { removed: true, remainingCount: next.length };
+}
+
 export async function getStoredProxyList(): Promise<string[]> {
   try {
     const [row] = await db
@@ -496,16 +582,27 @@ export async function getMaskedProxyStatus(): Promise<{
   count: number;
   maskedHost: string | null;
   maskedProxies: string[];
+  autoPrune: boolean;
   updatedAt: string | null;
 }> {
-  const [row] = await db
-    .select({ value: appConfigTable.value, updatedAt: appConfigTable.updatedAt })
-    .from(appConfigTable)
-    .where(eq(appConfigTable.key, YT_PROXY_DB_KEY))
-    .limit(1);
+  const [[row], autoPrune] = await Promise.all([
+    db
+      .select({ value: appConfigTable.value, updatedAt: appConfigTable.updatedAt })
+      .from(appConfigTable)
+      .where(eq(appConfigTable.key, YT_PROXY_DB_KEY))
+      .limit(1),
+    getProxyAutoPruneEnabled(),
+  ]);
 
   if (!row?.value) {
-    return { set: false, count: 0, maskedHost: null, maskedProxies: [], updatedAt: null };
+    return {
+      set: false,
+      count: 0,
+      maskedHost: null,
+      maskedProxies: [],
+      autoPrune,
+      updatedAt: null,
+    };
   }
 
   const parsed = parseAndValidateProxyList(row.value);
@@ -516,6 +613,7 @@ export async function getMaskedProxyStatus(): Promise<{
       count: 1,
       maskedHost: fallback,
       maskedProxies: [fallback],
+      autoPrune,
       updatedAt: row.updatedAt.toISOString(),
     };
   }
@@ -525,6 +623,7 @@ export async function getMaskedProxyStatus(): Promise<{
     count: parsed.proxies.length,
     maskedHost: parsed.summary,
     maskedProxies: parsed.maskedList,
+    autoPrune,
     updatedAt: row.updatedAt.toISOString(),
   };
 }

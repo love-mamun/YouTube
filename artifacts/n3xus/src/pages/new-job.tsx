@@ -9,6 +9,7 @@ import { Card } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Switch } from "@/components/ui/switch";
 import { useState, useCallback, useRef } from "react";
 import {
   Play,
@@ -24,6 +25,8 @@ import {
   X,
   CheckCircle2,
   Video,
+  Scissors,
+  Volume2,
 } from "lucide-react";
 
 const QUALITY_OPTIONS = [
@@ -162,6 +165,74 @@ function loadSavedMode(): string {
   return localStorage.getItem(LS_MODE) || "manual";
 }
 
+type AspectMode = "source" | "vertical_blur" | "vertical_crop";
+
+const ASPECT_OPTIONS: Array<{
+  value: AspectMode;
+  label: string;
+  desc: string;
+  preview: "source" | "blur" | "crop";
+}> = [
+  {
+    value: "source",
+    label: "Keep Source",
+    desc: "Original aspect ratio",
+    preview: "source",
+  },
+  {
+    value: "vertical_blur",
+    label: "9:16 Blurred",
+    desc: "Sharp center + blurred backdrop",
+    preview: "blur",
+  },
+  {
+    value: "vertical_crop",
+    label: "9:16 Center Crop",
+    desc: "Full-bleed vertical punch-in",
+    preview: "crop",
+  },
+];
+
+const CLIP_MAX_PRESETS: Array<{ value: number | null; label: string }> = [
+  { value: null, label: "Full" },
+  { value: 30, label: "30s" },
+  { value: 45, label: "45s" },
+  { value: 59, label: "59s" },
+];
+
+function parseTimecodeToSecs(raw: string): { valid: boolean; secs: number | null } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { valid: true, secs: null };
+  if (/^\d+$/.test(trimmed)) {
+    const n = parseInt(trimmed, 10);
+    return n >= 0 && n <= 36000 ? { valid: true, secs: n } : { valid: false, secs: null };
+  }
+  const parts = trimmed.split(":");
+  if (parts.length === 2 && /^\d{1,3}$/.test(parts[0]) && /^\d{1,2}$/.test(parts[1])) {
+    const m = parseInt(parts[0], 10);
+    const s = parseInt(parts[1], 10);
+    if (s < 60) {
+      const total = m * 60 + s;
+      return total <= 36000 ? { valid: true, secs: total } : { valid: false, secs: null };
+    }
+  }
+  if (
+    parts.length === 3 &&
+    /^\d{1,2}$/.test(parts[0]) &&
+    /^\d{1,2}$/.test(parts[1]) &&
+    /^\d{1,2}$/.test(parts[2])
+  ) {
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    const s = parseInt(parts[2], 10);
+    if (m < 60 && s < 60) {
+      const total = h * 3600 + m * 60 + s;
+      return total <= 36000 ? { valid: true, secs: total } : { valid: false, secs: null };
+    }
+  }
+  return { valid: false, secs: null };
+}
+
 export default function NewJob() {
   const [, navigate] = useLocation();
   const [urls, setUrls] = useState<UrlEntry[]>([
@@ -169,6 +240,10 @@ export default function NewJob() {
   ]);
   const [quality, setQuality] = useState<string>("none");
   const [codec, setCodec] = useState<string>("any");
+  const [aspectMode, setAspectMode] = useState<AspectMode>("source");
+  const [clipStartText, setClipStartText] = useState("");
+  const [clipMaxSecs, setClipMaxSecs] = useState<number | null>(null);
+  const [audioNormalize, setAudioNormalize] = useState(false);
   const [publishMode, setPublishMode] = useState<string>(loadSavedMode);
   const [platforms, setPlatforms] = useState<string[]>(loadSavedPlatforms);
   const [scheduledAt, setScheduledAt] = useState("");
@@ -272,8 +347,21 @@ export default function NewJob() {
     localStorage.setItem(LS_MODE, mode);
   };
 
+  const parsedStart = parseTimecodeToSecs(clipStartText);
+  const hasShortFormTransforms =
+    aspectMode !== "source" ||
+    (parsedStart.secs !== null && parsedStart.secs > 0) ||
+    clipMaxSecs !== null ||
+    audioNormalize;
+  const needsDownloadForTransforms = hasShortFormTransforms && quality === "none";
+
   const validUrls = urls.filter((u) => u.value.trim());
-  const canSubmit = !isSubmitting && validUrls.length > 0 && platforms.length > 0;
+  const canSubmit =
+    !isSubmitting &&
+    validUrls.length > 0 &&
+    platforms.length > 0 &&
+    parsedStart.valid &&
+    !needsDownloadForTransforms;
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -292,20 +380,25 @@ export default function NewJob() {
           )
         );
         try {
+          const payload = {
+            youtubeUrl: entry.value.trim(),
+            publishMode: publishMode as "auto" | "scheduled" | "manual",
+            platforms: platforms.join(","),
+            scheduledAt: scheduledAt || null,
+            ...(quality !== "none"
+              ? { quality: quality as "360p" | "480p" | "720p" | "1080p" | "1440p" | "4k" }
+              : {}),
+            ...(quality !== "none" && codec !== "any"
+              ? { codec: codec as "av1" | "vp9" | "h264" }
+              : {}),
+            missionType: "normal" as const,
+            aspectMode,
+            clipStartSecs: parsedStart.secs,
+            clipMaxSecs,
+            audioNormalize,
+          };
           const job = await createJob.mutateAsync({
-            data: {
-              youtubeUrl: entry.value.trim(),
-              publishMode: publishMode as "auto" | "scheduled" | "manual",
-              platforms: platforms.join(","),
-              scheduledAt: scheduledAt || null,
-              ...(quality !== "none"
-                ? { quality: quality as "360p" | "480p" | "720p" | "1080p" | "1440p" | "4k" }
-                : {}),
-              ...(quality !== "none" && codec !== "any"
-                ? { codec: codec as "av1" | "vp9" | "h264" }
-                : {}),
-              missionType: "normal",
-            },
+            data: payload as Parameters<typeof createJob.mutateAsync>[0]["data"],
           });
           setUrls((prev) =>
             prev.map((u) => (u.id === entry.id ? { ...u, status: "done" } : u))
@@ -336,6 +429,10 @@ export default function NewJob() {
       validUrls,
       quality,
       codec,
+      aspectMode,
+      parsedStart.secs,
+      clipMaxSecs,
+      audioNormalize,
       publishMode,
       platforms,
       scheduledAt,
@@ -353,6 +450,8 @@ export default function NewJob() {
     CODEC_OPTIONS.find((c) => c.value === codec) ?? CODEC_OPTIONS[0];
   const selectedModeObj =
     PUBLISH_MODES.find((m) => m.value === publishMode) ?? PUBLISH_MODES[2];
+  const selectedAspectObj =
+    ASPECT_OPTIONS.find((a) => a.value === aspectMode) ?? ASPECT_OPTIONS[0];
 
   return (
     <Layout>
@@ -593,6 +692,169 @@ export default function NewJob() {
               )}
             </Card>
 
+            {/* Short-Form 9:16 Studio */}
+            <Card className="p-4 sm:p-6 border-border bg-card space-y-5">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <h2 className="text-base font-display font-semibold text-foreground">
+                    Short-Form 9:16 Studio{" "}
+                    <span className="text-xs font-normal text-muted-foreground">
+                      · Shorts &amp; Reels
+                    </span>
+                  </h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Reframe landscape clips into 9:16 vertical video, trim highlight windows, and normalize loudness.
+                  </p>
+                </div>
+              </div>
+
+              {/* Aspect Ratio Selector */}
+              <div className="space-y-2">
+                <Label className="text-xs font-medium text-muted-foreground">
+                  Output Framing
+                </Label>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  {ASPECT_OPTIONS.map((opt) => {
+                    const selected = aspectMode === opt.value;
+                    return (
+                      <button
+                        type="button"
+                        key={opt.value}
+                        onClick={() => setAspectMode(opt.value)}
+                        className={`text-left p-3.5 rounded-lg border transition-colors min-h-[68px] flex items-center gap-3 ${
+                          selected
+                            ? "border-primary bg-primary/10"
+                            : "border-border bg-muted/25 hover:border-muted-foreground/40 hover:bg-muted/40"
+                        }`}
+                      >
+                        <div
+                          className={`shrink-0 flex items-center justify-center rounded border ${
+                            opt.preview === "source"
+                              ? "w-8 h-5"
+                              : "w-5 h-8"
+                          } ${
+                            selected
+                              ? "border-primary bg-primary/20"
+                              : "border-muted-foreground/40 bg-muted/50"
+                          }`}
+                          aria-hidden="true"
+                        >
+                          {opt.preview === "blur" && (
+                            <div className="w-full h-2.5 bg-primary/60" />
+                          )}
+                          {opt.preview === "crop" && (
+                            <div className="w-full h-full bg-primary/35" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <span
+                            className={`text-sm font-medium block ${
+                              selected ? "text-primary" : "text-foreground"
+                            }`}
+                          >
+                            {opt.label}
+                          </span>
+                          <span className="text-xs text-muted-foreground block mt-0.5 leading-snug">
+                            {opt.desc}
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Clip Trim Controls */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-3 border-t border-border">
+                <div className="space-y-1.5">
+                  <Label
+                    htmlFor="clip-start-time"
+                    className="text-xs font-medium text-muted-foreground flex items-center gap-1.5"
+                  >
+                    <Scissors className="w-3.5 h-3.5 text-primary" /> Start Time (optional)
+                  </Label>
+                  <Input
+                    id="clip-start-time"
+                    value={clipStartText}
+                    onChange={(e) => setClipStartText(e.target.value)}
+                    placeholder="0:00 or seconds (e.g. 1:15)"
+                    className={`font-mono text-sm bg-muted/60 border-border focus:border-primary min-h-[44px] h-11 ${
+                      !parsedStart.valid ? "border-red-500/60" : ""
+                    }`}
+                  />
+                  {!parsedStart.valid && (
+                    <p className="text-xs text-red-400 font-mono">
+                      Use MM:SS, HH:MM:SS, or seconds.
+                    </p>
+                  )}
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-xs font-medium text-muted-foreground">
+                    Max Clip Length
+                  </Label>
+                  <div className="grid grid-cols-4 gap-2">
+                    {CLIP_MAX_PRESETS.map((preset) => {
+                      const selected = clipMaxSecs === preset.value;
+                      return (
+                        <button
+                          type="button"
+                          key={preset.label}
+                          onClick={() => setClipMaxSecs(preset.value)}
+                          className={`min-h-[44px] h-11 rounded-lg border font-mono text-xs font-medium transition-colors whitespace-nowrap ${
+                            selected
+                              ? "border-primary bg-primary/10 text-primary"
+                              : "border-border bg-muted/25 text-foreground hover:border-muted-foreground/40"
+                          }`}
+                        >
+                          {preset.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {/* Loudness Normalization Switch */}
+              <div className="flex items-center justify-between gap-4 pt-3 border-t border-border">
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <Volume2 className="w-4 h-4 text-primary shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-foreground">
+                      Normalize audio to -14 LUFS
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Balances speech and music volume to YouTube Shorts &amp; Reels standards.
+                    </p>
+                  </div>
+                </div>
+                <Switch
+                  checked={audioNormalize}
+                  onCheckedChange={setAudioNormalize}
+                  aria-label="Normalize audio loudness"
+                />
+              </div>
+
+              {needsDownloadForTransforms && (
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <span>
+                      9:16 vertical framing and clip trim require downloading the video stream.
+                    </span>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => setQuality("720p")}
+                    className="min-h-[38px] bg-primary text-primary-foreground hover:bg-primary/90 text-xs font-medium whitespace-nowrap shrink-0"
+                  >
+                    Use 720p HD
+                  </Button>
+                </div>
+              )}
+            </Card>
+
             {/* Target Platforms & Publish Mode */}
             <Card className="p-4 sm:p-6 border-border bg-card space-y-5">
               <div className="space-y-3">
@@ -728,6 +990,29 @@ export default function NewJob() {
                   <span className="text-muted-foreground">Codec</span>
                   <span className="font-mono font-medium text-foreground">
                     {selectedCodecObj.label}
+                  </span>
+                </div>
+              )}
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Framing</span>
+                <span className="font-mono font-medium text-foreground">
+                  {selectedAspectObj.label}
+                </span>
+              </div>
+              {(clipMaxSecs !== null || (parsedStart.secs !== null && parsedStart.secs > 0)) && (
+                <div className="py-2.5 flex items-center justify-between gap-2">
+                  <span className="text-muted-foreground">Clip Window</span>
+                  <span className="font-mono tabular-nums font-medium text-foreground">
+                    {parsedStart.secs ? `From ${clipStartText.trim()}` : "From 0:00"}
+                    {clipMaxSecs ? ` · Max ${clipMaxSecs}s` : ""}
+                  </span>
+                </div>
+              )}
+              {audioNormalize && (
+                <div className="py-2.5 flex items-center justify-between gap-2">
+                  <span className="text-muted-foreground">Audio</span>
+                  <span className="font-mono font-medium text-foreground">
+                    -14 LUFS
                   </span>
                 </div>
               )}

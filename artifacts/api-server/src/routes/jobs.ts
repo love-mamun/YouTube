@@ -1,5 +1,6 @@
 import { Router, type IRouter } from "express";
 import { eq, desc, and } from "drizzle-orm";
+import * as zod from "zod";
 import { db, videoJobsTable, publishLogsTable } from "@workspace/db";
 import {
   ListJobsQueryParams,
@@ -39,14 +40,33 @@ router.get("/jobs", async (req, res): Promise<void> => {
   res.json(jobs);
 });
 
+const ExtendedCreateJobBody = CreateJobBody.extend({
+  aspectMode: zod.enum(["source", "vertical_blur", "vertical_crop"]).optional(),
+  clipStartSecs: zod.number().int().min(0).max(36000).nullish(),
+  clipMaxSecs: zod.number().int().min(5).max(300).nullish(),
+  audioNormalize: zod.boolean().optional(),
+});
+
 router.post("/jobs", async (req, res): Promise<void> => {
-  const parsed = CreateJobBody.safeParse(req.body);
+  const parsed = ExtendedCreateJobBody.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.message });
     return;
   }
 
-  const { youtubeUrl, publishMode, platforms, scheduledAt, quality, codec, missionType } = parsed.data;
+  const {
+    youtubeUrl,
+    publishMode,
+    platforms,
+    scheduledAt,
+    quality,
+    codec,
+    missionType,
+    aspectMode,
+    clipStartSecs,
+    clipMaxSecs,
+    audioNormalize,
+  } = parsed.data;
 
   const [job] = await db
     .insert(videoJobsTable)
@@ -58,6 +78,10 @@ router.post("/jobs", async (req, res): Promise<void> => {
       quality: quality ?? null,
       codec: codec ?? null,
       missionType: missionType ?? "normal",
+      aspectMode: aspectMode ?? "source",
+      clipStartSecs: clipStartSecs ?? null,
+      clipMaxSecs: clipMaxSecs ?? null,
+      audioNormalize: audioNormalize ? "loudnorm" : null,
       status: "pending",
       progress: 0,
     })

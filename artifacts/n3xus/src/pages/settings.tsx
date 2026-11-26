@@ -40,8 +40,14 @@ import {
   ShieldCheck,
   Globe,
   Activity,
+  ListFilter,
+  Copy,
+  Check,
+  Terminal,
+  GitBranch,
 } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
 import {
   previewNetscapeCookiesClient,
   previewProxyListClient,
@@ -328,14 +334,84 @@ export default function Settings() {
     count: number;
     maskedHost: string | null;
     maskedProxies: string[];
+    autoPrune: boolean;
     updatedAt: string | null;
-  }>({ set: false, count: 0, maskedHost: null, maskedProxies: [], updatedAt: null });
+  }>({
+    set: false,
+    count: 0,
+    maskedHost: null,
+    maskedProxies: [],
+    autoPrune: false,
+    updatedAt: null,
+  });
   const [proxyInput, setProxyInput] = useState("");
   const [maskProxyInput, setMaskProxyInput] = useState(false);
   const [proxySaving, setProxySaving] = useState(false);
   const [proxySavedOk, setProxySavedOk] = useState(false);
   const [proxyError, setProxyError] = useState<string | null>(null);
+  const [proxyPruning, setProxyPruning] = useState(false);
+  const [autoPruneSaving, setAutoPruneSaving] = useState(false);
+  const [deletingProxyIdx, setDeletingProxyIdx] = useState<number | null>(null);
+  const [pruneResult, setPruneResult] = useState<{
+    total: number;
+    workingCount: number;
+    removedCount: number;
+    saved: boolean;
+    mixedSchemeNote?: boolean;
+    results: Array<{
+      maskedHost: string;
+      templateEntry: string | null;
+      ok: boolean;
+      latencyMs: number | null;
+      error: string | null;
+    }>;
+  } | null>(null);
   const proxyPreview = previewProxyListClient(proxyInput);
+
+  // GitHub Auto-Scraper & API Trigger state
+  interface ScraperBuiltinFeed {
+    id: string;
+    label: string;
+    protocol: "http" | "socks4" | "socks5";
+    url: string;
+    defaultEnabled: boolean;
+  }
+  interface ScraperRunReport {
+    ok: boolean;
+    triggeredBy: "api_token" | "settings_ui";
+    ranAt: string;
+    durationMs: number;
+    poolReplaced: boolean;
+    scrapedTotal: number;
+    testedCount: number;
+    workingFound: number;
+    savedCount: number;
+    fastestMs: number | null;
+    topProxies: Array<{ maskedHost: string; latencyMs: number | null }>;
+    sources: Array<{
+      id: string;
+      label: string;
+      protocol: string;
+      ok: boolean;
+      parsedCount: number;
+      error: string | null;
+    }>;
+    message: string;
+  }
+  const [scraperFeeds, setScraperFeeds] = useState<ScraperBuiltinFeed[]>([]);
+  const [scraperEnabledIds, setScraperEnabledIds] = useState<string[]>([]);
+  const [scraperCustomText, setScraperCustomText] = useState("");
+  const [scraperTokenConfigured, setScraperTokenConfigured] = useState(false);
+  const [scraperTokenUpdatedAt, setScraperTokenUpdatedAt] = useState<string | null>(null);
+  const [revealedTriggerToken, setRevealedTriggerToken] = useState<string | null>(null);
+  const [copiedTriggerType, setCopiedTriggerType] = useState<"url" | "curl" | null>(null);
+  const [scraperLastRun, setScraperLastRun] = useState<ScraperRunReport | null>(null);
+  const [scraperSyncing, setScraperSyncing] = useState(false);
+  const [scraperSavingCfg, setScraperSavingCfg] = useState(false);
+  const [scraperCfgSavedOk, setScraperCfgSavedOk] = useState(false);
+  const [scraperTokenBusy, setScraperTokenBusy] = useState(false);
+  const [scraperError, setScraperError] = useState<string | null>(null);
+  const [showScraperSources, setShowScraperSources] = useState(false);
 
   // Diagnostics probe state
   const [diagRunning, setDiagRunning] = useState(false);
@@ -348,7 +424,12 @@ export default function Settings() {
       count?: number;
       reachableCount?: number;
       maskedHost: string | null;
-      proxies?: Array<{ maskedHost: string; ok: boolean; error: string | null }>;
+      proxies?: Array<{
+        maskedHost: string;
+        ok: boolean;
+        latencyMs?: number | null;
+        error: string | null;
+      }>;
       ok: boolean | null;
       error: string | null;
     };
@@ -501,6 +582,7 @@ export default function Settings() {
           count?: number;
           maskedHost: string | null;
           maskedProxies?: string[];
+          autoPrune?: boolean;
           updatedAt: string | null;
         };
         setProxyStatus({
@@ -512,6 +594,7 @@ export default function Settings() {
             : data.maskedHost
             ? [data.maskedHost]
             : [],
+          autoPrune: Boolean(data.autoPrune),
           updatedAt: data.updatedAt ?? null,
         });
       }
@@ -628,6 +711,7 @@ export default function Settings() {
         return;
       }
       setProxyInput("");
+      setPruneResult(null);
       setProxySavedOk(true);
       setTimeout(() => setProxySavedOk(false), 4000);
       await fetchProxyStatus();
@@ -638,8 +722,124 @@ export default function Settings() {
     }
   };
 
+  const handlePruneProxies = async (mode: "editor" | "saved") => {
+    if (mode === "editor" && !proxyInput.trim()) return;
+    setProxyPruning(true);
+    setProxyError(null);
+    setPruneResult(null);
+    try {
+      const res = await fetch(`${BASE}/api/settings/yt-proxy/prune`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          proxyUrl: mode === "editor" ? proxyInput : undefined,
+          saveWorkingOnly: mode === "saved",
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        total?: number;
+        workingCount?: number;
+        removedCount?: number;
+        saved?: boolean;
+        results?: Array<{
+          maskedHost: string;
+          templateEntry: string | null;
+          ok: boolean;
+          latencyMs: number | null;
+          error: string | null;
+        }>;
+      };
+      if (!res.ok) {
+        setProxyError(data.error ?? `Proxy prune check failed (${res.status})`);
+        return;
+      }
+
+      const results = Array.isArray(data.results) ? data.results : [];
+      let mixedSchemeNote = false;
+
+      if (mode === "editor") {
+        const workingResults = results.filter((r) => r.ok);
+        const templateEntries = workingResults
+          .map((r) => r.templateEntry)
+          .filter((v): v is string => Boolean(v));
+        if (workingResults.length === 0) {
+          setProxyInput("");
+        } else if (templateEntries.length === workingResults.length) {
+          setProxyInput(templateEntries.join(",\n"));
+        } else {
+          // Mixed or credential-bearing proxies: keep authenticated entries safely untouched
+          mixedSchemeNote = true;
+        }
+      }
+
+      setPruneResult({
+        total: data.total ?? results.length,
+        workingCount: data.workingCount ?? 0,
+        removedCount: data.removedCount ?? 0,
+        saved: Boolean(data.saved),
+        mixedSchemeNote,
+        results,
+      });
+
+      if (mode === "saved") {
+        await fetchProxyStatus();
+      }
+    } catch {
+      setProxyError("Network error checking proxies.");
+    } finally {
+      setProxyPruning(false);
+    }
+  };
+
+  const handleToggleAutoPrune = async (enabled: boolean) => {
+    const prev = proxyStatus.autoPrune;
+    setProxyStatus((s) => ({ ...s, autoPrune: enabled }));
+    setAutoPruneSaving(true);
+    setProxyError(null);
+    try {
+      const res = await fetch(`${BASE}/api/settings/yt-proxy/autoprune`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!res.ok) {
+        setProxyStatus((s) => ({ ...s, autoPrune: prev }));
+        setProxyError("Failed to update auto-prune preference.");
+      }
+    } catch {
+      setProxyStatus((s) => ({ ...s, autoPrune: prev }));
+      setProxyError("Network error updating auto-prune.");
+    } finally {
+      setAutoPruneSaving(false);
+    }
+  };
+
+  const handleDeleteProxyEntry = async (idx: number, maskedHost: string) => {
+    setDeletingProxyIdx(idx);
+    setProxyError(null);
+    try {
+      const res = await fetch(`${BASE}/api/settings/yt-proxy/entry`, {
+        method: "DELETE",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ index: idx, maskedHost }),
+      });
+      if (res.ok) {
+        await fetchProxyStatus();
+      }
+    } catch {
+      setProxyError("Failed to remove proxy entry.");
+    } finally {
+      setDeletingProxyIdx(null);
+    }
+  };
+
   const handleDeleteProxy = async () => {
     setProxyError(null);
+    setPruneResult(null);
     try {
       await fetch(`${BASE}/api/settings/yt-proxy`, {
         method: "DELETE",
@@ -680,6 +880,152 @@ export default function Settings() {
     }
   };
 
+  const fetchScraperConfig = async () => {
+    try {
+      const res = await fetch(`${BASE}/api/settings/proxy-scraper`, {
+        credentials: "include",
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        builtinFeeds?: ScraperBuiltinFeed[];
+        enabledFeedIds?: string[];
+        customUrls?: string[];
+        tokenConfigured?: boolean;
+        tokenUpdatedAt?: string | null;
+        lastRun?: ScraperRunReport | null;
+      };
+      if (Array.isArray(data.builtinFeeds)) setScraperFeeds(data.builtinFeeds);
+      if (Array.isArray(data.enabledFeedIds)) setScraperEnabledIds(data.enabledFeedIds);
+      if (Array.isArray(data.customUrls)) setScraperCustomText(data.customUrls.join("\n"));
+      setScraperTokenConfigured(Boolean(data.tokenConfigured));
+      setScraperTokenUpdatedAt(data.tokenUpdatedAt ?? null);
+      setScraperLastRun(data.lastRun ?? null);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const handleSyncGithubProxies = async () => {
+    setScraperSyncing(true);
+    setScraperError(null);
+    try {
+      const res = await fetch(`${BASE}/api/proxy-scraper/run`, {
+        method: "POST",
+        credentials: "include",
+      });
+      const data = (await res.json().catch(() => ({}))) as ScraperRunReport & {
+        error?: string;
+      };
+      if (!res.ok) {
+        setScraperError(data.error ?? `GitHub proxy sync failed (${res.status})`);
+        return;
+      }
+      setScraperLastRun(data);
+      setPruneResult(null);
+      await fetchProxyStatus();
+    } catch {
+      setScraperError("Network error while scraping GitHub proxy lists.");
+    } finally {
+      setScraperSyncing(false);
+    }
+  };
+
+  const handleSaveScraperSources = async () => {
+    setScraperSavingCfg(true);
+    setScraperError(null);
+    setScraperCfgSavedOk(false);
+    try {
+      const customUrls = scraperCustomText
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const res = await fetch(`${BASE}/api/settings/proxy-scraper`, {
+        method: "PUT",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabledFeedIds: scraperEnabledIds,
+          customUrls,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        setScraperError(data.error ?? `Failed to save sources (${res.status})`);
+        return;
+      }
+      setScraperCfgSavedOk(true);
+      setTimeout(() => setScraperCfgSavedOk(false), 3500);
+      await fetchScraperConfig();
+    } catch {
+      setScraperError("Network error saving scraper sources.");
+    } finally {
+      setScraperSavingCfg(false);
+    }
+  };
+
+  const handleRotateScraperToken = async () => {
+    setScraperTokenBusy(true);
+    setScraperError(null);
+    try {
+      const res = await fetch(`${BASE}/api/settings/proxy-scraper/token/rotate`, {
+        method: "POST",
+        credentials: "include",
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        token?: string;
+        updatedAt?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.token) {
+        setScraperError(data.error ?? "Failed to generate API trigger token.");
+        return;
+      }
+      setRevealedTriggerToken(data.token);
+      setScraperTokenConfigured(true);
+      setScraperTokenUpdatedAt(data.updatedAt ?? new Date().toISOString());
+    } catch {
+      setScraperError("Network error generating API trigger token.");
+    } finally {
+      setScraperTokenBusy(false);
+    }
+  };
+
+  const handleRevokeScraperToken = async () => {
+    setScraperTokenBusy(true);
+    setScraperError(null);
+    try {
+      const res = await fetch(`${BASE}/api/settings/proxy-scraper/token`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (res.ok) {
+        setRevealedTriggerToken(null);
+        setScraperTokenConfigured(false);
+        setScraperTokenUpdatedAt(null);
+      }
+    } catch {
+      setScraperError("Network error revoking API trigger token.");
+    } finally {
+      setScraperTokenBusy(false);
+    }
+  };
+
+  const handleCopyTriggerSnippet = async (kind: "url" | "curl") => {
+    if (!revealedTriggerToken || typeof window === "undefined") return;
+    const baseEndpoint = `${window.location.origin}${BASE}/api/proxy-scraper/run`;
+    const payload =
+      kind === "url"
+        ? `${baseEndpoint}?token=${encodeURIComponent(revealedTriggerToken)}`
+        : `curl -X POST -H "Authorization: Bearer ${revealedTriggerToken}" "${baseEndpoint}"`;
+    try {
+      await navigator.clipboard.writeText(payload);
+      setCopiedTriggerType(kind);
+      setTimeout(() => setCopiedTriggerType(null), 2500);
+    } catch {
+      setScraperError("Clipboard write blocked by browser — copy manually from the field.");
+    }
+  };
+
   useEffect(() => {
     if (!authed) return;
     fetchYtChannels();
@@ -687,6 +1033,7 @@ export default function Settings() {
     fetchCredStatus();
     fetchCookiesStatus();
     fetchProxyStatus();
+    fetchScraperConfig();
     fetchLogoStatus();
   }, [authed]);
 
@@ -1351,11 +1698,15 @@ export default function Settings() {
                         >
                           <span className="text-foreground truncate">{item.maskedHost}</span>
                           <span
-                            className={`shrink-0 ${
+                            className={`shrink-0 tabular-nums ${
                               item.ok ? "text-emerald-400" : "text-red-400"
                             }`}
                           >
-                            {item.ok ? "Reachable" : item.error ?? "Failed"}
+                            {item.ok
+                              ? item.latencyMs
+                                ? `OK · ${item.latencyMs} ms`
+                                : "Reachable"
+                              : item.error ?? "Failed"}
                           </span>
                         </div>
                       ))}
@@ -1480,7 +1831,7 @@ export default function Settings() {
 
           {proxyStatus.set && (
             <div className="rounded-lg bg-muted/35 border border-border overflow-hidden">
-              <div className="flex items-center justify-between px-3.5 py-2.5 gap-2">
+              <div className="flex flex-wrap items-center justify-between px-3.5 py-2.5 gap-2">
                 <div className="text-xs font-mono text-foreground truncate tabular-nums">
                   {proxyStatus.count > 1
                     ? `Active pool (${proxyStatus.count} proxies)`
@@ -1492,27 +1843,58 @@ export default function Settings() {
                     </span>
                   )}
                 </div>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={handleDeleteProxy}
-                  className="text-xs font-medium gap-1 min-h-[36px] text-destructive hover:text-destructive hover:bg-destructive/10 px-2.5 shrink-0"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />{" "}
-                  {proxyStatus.count > 1 ? "Remove All" : "Remove"}
-                </Button>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handlePruneProxies("saved")}
+                    disabled={proxyPruning}
+                    className="text-xs font-medium gap-1.5 min-h-[36px] border-border bg-card hover:bg-muted px-2.5 whitespace-nowrap"
+                  >
+                    {proxyPruning ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
+                    ) : (
+                      <ListFilter className="w-3.5 h-3.5 text-primary" />
+                    )}
+                    Prune Dead
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={handleDeleteProxy}
+                    className="text-xs font-medium gap-1 min-h-[36px] text-destructive hover:text-destructive hover:bg-destructive/10 px-2.5 whitespace-nowrap"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />{" "}
+                    {proxyStatus.count > 1 ? "Remove All" : "Remove"}
+                  </Button>
+                </div>
               </div>
               {proxyStatus.maskedProxies.length > 0 && (
-                <div className="border-t border-border divide-y divide-border max-h-40 overflow-y-auto">
+                <div className="border-t border-border divide-y divide-border max-h-48 overflow-y-auto">
                   {proxyStatus.maskedProxies.map((host, idx) => (
                     <div
                       key={`${host}-${idx}`}
-                      className="flex items-center justify-between px-3.5 py-1.5 text-xs font-mono"
+                      className="flex items-center justify-between gap-2 px-3.5 py-1.5 text-xs font-mono"
                     >
-                      <span className="text-primary truncate">{host}</span>
-                      <span className="text-muted-foreground tabular-nums shrink-0">
-                        #{idx + 1}
-                      </span>
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-muted-foreground tabular-nums shrink-0">
+                          #{idx + 1}
+                        </span>
+                        <span className="text-primary truncate">{host}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteProxyEntry(idx, host)}
+                        disabled={deletingProxyIdx === idx}
+                        aria-label={`Remove ${host}`}
+                        className="min-w-[36px] min-h-[36px] flex items-center justify-center rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors shrink-0"
+                      >
+                        {deletingProxyIdx === idx ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="w-3.5 h-3.5" />
+                        )}
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -1610,7 +1992,66 @@ export default function Settings() {
             </div>
           )}
 
-          <div className="flex flex-col sm:flex-row gap-2.5">
+          {pruneResult && (
+            <div className="rounded-lg border border-border bg-muted/25 overflow-hidden">
+              <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 text-xs font-mono">
+                <span className="tabular-nums text-foreground">
+                  <strong className="text-emerald-400">
+                    {pruneResult.workingCount} working
+                  </strong>{" "}
+                  ·{" "}
+                  <span className="text-muted-foreground">
+                    {pruneResult.removedCount} dead{" "}
+                    {pruneResult.saved ? "pruned from pool" : "filtered"}
+                  </span>
+                </span>
+                {pruneResult.saved && (
+                  <span className="text-emerald-400">Pool updated</span>
+                )}
+              </div>
+              {pruneResult.mixedSchemeNote && (
+                <p className="px-3.5 pb-2 text-xs text-amber-300">
+                  Credentialed or SOCKS proxies were tested safely and kept intact in your editor.
+                </p>
+              )}
+              {pruneResult.results.length > 0 && (
+                <div className="border-t border-border divide-y divide-border max-h-44 overflow-y-auto text-xs font-mono">
+                  {pruneResult.results.slice(0, 20).map((item, idx) => (
+                    <div
+                      key={`${item.maskedHost}-${idx}`}
+                      className="flex items-center justify-between gap-2 px-3.5 py-1.5"
+                    >
+                      <span className="text-foreground truncate">
+                        {item.maskedHost}
+                      </span>
+                      <span
+                        className={`shrink-0 tabular-nums ${
+                          item.ok
+                            ? item.latencyMs && item.latencyMs > 1800
+                              ? "text-amber-400"
+                              : "text-emerald-400"
+                            : "text-red-400"
+                        }`}
+                      >
+                        {item.ok
+                          ? item.latencyMs
+                            ? `${item.latencyMs} ms`
+                            : "OK"
+                          : item.error ?? "Failed"}
+                      </span>
+                    </div>
+                  ))}
+                  {pruneResult.results.length > 20 && (
+                    <div className="px-3.5 py-1.5 text-muted-foreground tabular-nums">
+                      +{pruneResult.results.length - 20} more tested
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex flex-col sm:flex-row flex-wrap gap-2.5">
             <Button
               onClick={handleSaveProxy}
               disabled={
@@ -1619,7 +2060,7 @@ export default function Settings() {
                 (proxyPreview !== null &&
                   (proxyPreview.invalidCount > 0 || proxyPreview.validCount === 0))
               }
-              className="flex-1 font-medium text-sm gap-2 min-h-[44px] h-11 bg-primary text-primary-foreground hover:bg-primary/90"
+              className="flex-1 font-medium text-sm gap-2 min-h-[44px] h-11 bg-primary text-primary-foreground hover:bg-primary/90 whitespace-nowrap"
             >
               {proxySaving ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
@@ -1640,9 +2081,29 @@ export default function Settings() {
             <Button
               type="button"
               variant="outline"
+              onClick={() => handlePruneProxies("editor")}
+              disabled={
+                !proxyInput.trim() ||
+                proxyPruning ||
+                (proxyPreview !== null &&
+                  (proxyPreview.invalidCount > 0 || proxyPreview.validCount === 0))
+              }
+              className="font-medium text-sm gap-2 min-h-[44px] h-11 border-border bg-muted/40 hover:bg-muted whitespace-nowrap shrink-0"
+            >
+              {proxyPruning ? (
+                <Loader2 className="w-4 h-4 animate-spin text-primary" />
+              ) : (
+                <ListFilter className="w-4 h-4 text-primary" />
+              )}
+              Filter Working Only
+            </Button>
+
+            <Button
+              type="button"
+              variant="outline"
               onClick={() => handleRunDiagnostics(proxyInput || undefined)}
               disabled={diagRunning || (!proxyInput.trim() && !proxyStatus.set)}
-              className="font-medium text-sm gap-2 min-h-[44px] h-11 border-border bg-muted/40 hover:bg-muted"
+              className="font-medium text-sm gap-2 min-h-[44px] h-11 border-border bg-muted/40 hover:bg-muted whitespace-nowrap shrink-0"
             >
               {diagRunning ? (
                 <Loader2 className="w-4 h-4 animate-spin text-primary" />
@@ -1651,6 +2112,304 @@ export default function Settings() {
               )}
               Test Proxy Pool
             </Button>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 pt-3 border-t border-border">
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-foreground">
+                Auto-prune failing proxies during downloads
+              </p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Automatically removes dead or repeatedly timed-out proxies from your saved pool.
+              </p>
+            </div>
+            <Switch
+              checked={proxyStatus.autoPrune}
+              disabled={autoPruneSaving}
+              onCheckedChange={handleToggleAutoPrune}
+              aria-label="Auto-prune failing proxies"
+            />
+          </div>
+
+          {/* ── Automated GitHub Proxy Scraper & One-Call API Trigger ────── */}
+          <div className="pt-4 border-t border-border space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-8 h-8 rounded-lg bg-primary/12 flex items-center justify-center shrink-0 mt-0.5">
+                  <GitBranch className="w-4 h-4 text-primary" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-display font-semibold text-foreground">
+                    GitHub Proxy Auto-Scraper &amp; API Trigger
+                  </h3>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Scrapes public GitHub proxy feeds, tests live tunnel reachability, and replaces your pool with the top 30 fastest working proxies in one call.
+                  </p>
+                </div>
+              </div>
+
+              <Button
+                type="button"
+                onClick={handleSyncGithubProxies}
+                disabled={scraperSyncing}
+                className="font-medium text-xs gap-1.5 min-h-[40px] h-10 bg-primary text-primary-foreground hover:bg-primary/90 whitespace-nowrap shrink-0"
+              >
+                {scraperSyncing ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-3.5 h-3.5" />
+                )}
+                {scraperSyncing ? "Scraping & Testing…" : "Sync from GitHub Now"}
+              </Button>
+            </div>
+
+            {scraperError && (
+              <div className="flex items-center gap-2 text-xs text-red-300 bg-red-500/10 border border-red-500/25 rounded-lg p-3">
+                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                <span>{scraperError}</span>
+              </div>
+            )}
+
+            {scraperLastRun && (
+              <div className="rounded-lg border border-border bg-muted/25 p-3.5 space-y-2.5 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span
+                    className={`font-medium ${
+                      scraperLastRun.ok ? "text-emerald-400" : "text-amber-400"
+                    }`}
+                  >
+                    {scraperLastRun.message}
+                  </span>
+                  <span className="font-mono text-muted-foreground tabular-nums">
+                    {new Date(scraperLastRun.ranAt).toLocaleString()}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground font-mono tabular-nums">
+                  <span>Scraped: {scraperLastRun.scrapedTotal.toLocaleString()}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>Tested: {scraperLastRun.testedCount}</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-emerald-400">
+                    Saved: {scraperLastRun.savedCount} / 30
+                  </span>
+                  {scraperLastRun.fastestMs !== null && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span>Fastest: {scraperLastRun.fastestMs} ms</span>
+                    </>
+                  )}
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Trigger:{" "}
+                    {scraperLastRun.triggeredBy === "api_token"
+                      ? "API Token"
+                      : "Settings UI"}
+                  </span>
+                </div>
+
+                {scraperLastRun.sources.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-mono text-muted-foreground pt-1 border-t border-border/70 tabular-nums">
+                    {scraperLastRun.sources.map((src) => (
+                      <span key={src.id}>
+                        {src.label}:{" "}
+                        <span className={src.ok ? "text-foreground" : "text-red-400"}>
+                          {src.ok ? `${src.parsedCount}` : src.error ?? "Failed"}
+                        </span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* One-Call API Trigger Endpoint & Secret Token */}
+            <div className="rounded-lg border border-border bg-muted/25 p-3.5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-foreground flex items-center gap-1.5">
+                    <Terminal className="w-3.5 h-3.5 text-primary" />
+                    One-Call API Trigger Endpoint
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-0.5 font-mono truncate tabular-nums">
+                    GET / POST{" "}
+                    {typeof window !== "undefined"
+                      ? `${window.location.origin}${BASE}/api/proxy-scraper/run`
+                      : "/api/proxy-scraper/run"}
+                    {scraperTokenConfigured && scraperTokenUpdatedAt
+                      ? ` · Token active (updated ${new Date(scraperTokenUpdatedAt).toLocaleDateString()})`
+                      : " · No API token generated"}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={handleRotateScraperToken}
+                    disabled={scraperTokenBusy}
+                    className="text-xs font-medium gap-1.5 min-h-[36px] border-border bg-card hover:bg-muted whitespace-nowrap"
+                  >
+                    {scraperTokenBusy ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
+                    ) : (
+                      <Key className="w-3.5 h-3.5 text-primary" />
+                    )}
+                    {scraperTokenConfigured ? "Rotate Token" : "Generate API Token"}
+                  </Button>
+                  {scraperTokenConfigured && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={handleRevokeScraperToken}
+                      disabled={scraperTokenBusy}
+                      className="text-xs font-medium min-h-[36px] text-destructive hover:text-destructive hover:bg-destructive/10 whitespace-nowrap"
+                    >
+                      Revoke
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {revealedTriggerToken && (
+                <div className="space-y-2 pt-2 border-t border-border">
+                  <p className="text-xs text-amber-300">
+                    Copy your trigger URL or cURL command now — the raw token is never stored in plain text and will hide when you leave this page.
+                  </p>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <Input
+                      readOnly
+                      value={
+                        typeof window !== "undefined"
+                          ? `${window.location.origin}${BASE}/api/proxy-scraper/run?token=${revealedTriggerToken}`
+                          : `/api/proxy-scraper/run?token=${revealedTriggerToken}`
+                      }
+                      className="font-mono text-xs bg-card border-border h-9"
+                    />
+                    <div className="flex items-center gap-2 shrink-0">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => handleCopyTriggerSnippet("url")}
+                        className="text-xs gap-1.5 min-h-[36px] border-border bg-card hover:bg-muted whitespace-nowrap"
+                      >
+                        {copiedTriggerType === "url" ? (
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5" />
+                        )}
+                        {copiedTriggerType === "url" ? "Copied URL" : "Copy API URL"}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => handleCopyTriggerSnippet("curl")}
+                        className="text-xs gap-1.5 min-h-[36px] border-border bg-card hover:bg-muted whitespace-nowrap"
+                      >
+                        {copiedTriggerType === "curl" ? (
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        ) : (
+                          <Terminal className="w-3.5 h-3.5" />
+                        )}
+                        {copiedTriggerType === "curl" ? "Copied cURL" : "Copy cURL"}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Collapsible GitHub Feed Sources & Custom Raw URLs */}
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowScraperSources((s) => !s)}
+                className="w-full flex items-center justify-between text-xs text-muted-foreground hover:text-foreground transition-colors bg-muted/40 rounded-lg px-3.5 min-h-[42px]"
+              >
+                <span className="font-medium text-foreground tabular-nums">
+                  GitHub Proxy Sources ({scraperEnabledIds.length} built-in
+                  {scraperCustomText.trim()
+                    ? ` · ${scraperCustomText.split(/\r?\n/).filter((l) => l.trim()).length} custom`
+                    : ""}
+                  )
+                </span>
+                {showScraperSources ? (
+                  <ChevronUp className="w-4 h-4" />
+                ) : (
+                  <ChevronDown className="w-4 h-4" />
+                )}
+              </button>
+
+              {showScraperSources && (
+                <div className="pt-3 space-y-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {scraperFeeds.map((feed) => {
+                      const active = scraperEnabledIds.includes(feed.id);
+                      return (
+                        <button
+                          key={feed.id}
+                          type="button"
+                          onClick={() =>
+                            setScraperEnabledIds((prev) =>
+                              prev.includes(feed.id)
+                                ? prev.filter((id) => id !== feed.id)
+                                : [...prev, feed.id]
+                            )
+                          }
+                          className={`flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg border text-left text-xs transition-colors ${
+                            active
+                              ? "border-primary/50 bg-primary/10 text-foreground"
+                              : "border-border bg-muted/20 text-muted-foreground hover:text-foreground"
+                          }`}
+                        >
+                          <span className="font-medium truncate">{feed.label}</span>
+                          <span className="font-mono text-[11px] uppercase shrink-0">
+                            {active ? "Active" : "Off"}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label className="text-xs font-medium text-muted-foreground">
+                      Custom GitHub Raw Proxy URLs (one https://raw.githubusercontent.com/... URL per line)
+                    </Label>
+                    <Textarea
+                      placeholder="https://raw.githubusercontent.com/owner/repo/main/proxies.txt"
+                      value={scraperCustomText}
+                      onChange={(e) => setScraperCustomText(e.target.value)}
+                      rows={3}
+                      spellCheck={false}
+                      className="font-mono text-xs bg-muted/50 border-border focus:border-primary min-h-[84px]"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={handleSaveScraperSources}
+                      disabled={scraperSavingCfg}
+                      className="text-xs font-medium gap-1.5 min-h-[40px] border-border bg-muted/40 hover:bg-muted whitespace-nowrap"
+                    >
+                      {scraperSavingCfg ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
+                      ) : scraperCfgSavedOk ? (
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Save className="w-3.5 h-3.5 text-primary" />
+                      )}
+                      {scraperCfgSavedOk ? "Sources Saved" : "Save Scraper Sources"}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </Card>
 

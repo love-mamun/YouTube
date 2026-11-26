@@ -24,6 +24,10 @@ export const videoJobsTable = pgTable("video_jobs", {
   quality: text("quality"),
   codec: text("codec"),
   missionType: text("mission_type").default("normal"),
+  aspectMode: text("aspect_mode"),
+  clipStartSecs: integer("clip_start_secs"),
+  clipMaxSecs: integer("clip_max_secs"),
+  audioNormalize: text("audio_normalize"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at"),
 });

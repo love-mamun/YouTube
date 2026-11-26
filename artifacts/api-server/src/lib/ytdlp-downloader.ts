@@ -10,6 +10,9 @@ import {
   CHROME_UA,
   acquireJobCookieCopy,
   getStoredProxyList,
+  getProxyAutoPruneEnabled,
+  removeProxyFromStoredPool,
+  getPublicTemplateEntry,
   detectPotProvider,
   classifyYtDlpError,
   maskProxyUrl,
@@ -80,38 +83,251 @@ function rotateProxyPool<T>(list: T[]): T[] {
   return [...list.slice(offset), ...list.slice(0, offset)];
 }
 
-async function checkProxyReachability(
+export interface ProxyHealthEntry {
+  failCount: number;
+  lastLatencyMs: number | null;
+  cooldownUntil: number;
+}
+
+const proxyHealthMap = new Map<string, ProxyHealthEntry>();
+const PROXY_COOLDOWN_MS = 180_000;
+
+export function recordProxySuccess(proxyUrl: string, latencyMs: number | null): void {
+  const prev = proxyHealthMap.get(proxyUrl);
+  proxyHealthMap.set(proxyUrl, {
+    failCount: 0,
+    lastLatencyMs: latencyMs ?? prev?.lastLatencyMs ?? null,
+    cooldownUntil: 0,
+  });
+}
+
+export function recordProxyFailure(proxyUrl: string, now = Date.now()): ProxyHealthEntry {
+  const prev = proxyHealthMap.get(proxyUrl);
+  const failCount = (prev?.failCount ?? 0) + 1;
+  const entry: ProxyHealthEntry = {
+    failCount,
+    lastLatencyMs: prev?.lastLatencyMs ?? null,
+    cooldownUntil: now + PROXY_COOLDOWN_MS,
+  };
+  proxyHealthMap.set(proxyUrl, entry);
+  return entry;
+}
+
+export function rankAndFilterHealthyProxies(
+  proxies: string[],
+  healthMap: Map<string, ProxyHealthEntry> = proxyHealthMap,
+  now = Date.now()
+): string[] {
+  if (proxies.length <= 1) return [...proxies];
+  const healthy: string[] = [];
+  const coolingDown: string[] = [];
+  for (const p of proxies) {
+    const h = healthMap.get(p);
+    if (h && h.cooldownUntil > now) {
+      coolingDown.push(p);
+    } else {
+      healthy.push(p);
+    }
+  }
+  const sortByLatency = (a: string, b: string) => {
+    const la = healthMap.get(a)?.lastLatencyMs ?? Number.MAX_SAFE_INTEGER;
+    const lb = healthMap.get(b)?.lastLatencyMs ?? Number.MAX_SAFE_INTEGER;
+    return la - lb;
+  };
+  healthy.sort(sortByLatency);
+  coolingDown.sort((a, b) => (healthMap.get(a)?.failCount ?? 0) - (healthMap.get(b)?.failCount ?? 0));
+  return [...healthy, ...coolingDown];
+}
+
+export async function checkProxyReachability(
   proxyUrl: string,
-  timeoutMs = 3000
-): Promise<{ ok: boolean; error: string | null }> {
+  timeoutMs = 3500
+): Promise<{ ok: boolean; latencyMs: number | null; error: string | null }> {
+  const startedAt = Date.now();
   try {
     const parsed = new URL(proxyUrl);
     const host = parsed.hostname.replace(/^\[|\]$/g, "");
     const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
     if (!host || Number.isNaN(port) || port < 1 || port > 65535) {
-      return { ok: false, error: "Invalid proxy host or port" };
+      return { ok: false, latencyMs: null, error: "Invalid proxy host or port" };
     }
+
+    const proto = parsed.protocol.toLowerCase();
+
     await new Promise<void>((resolve, reject) => {
-      const socket = net.createConnection({ host, port, timeout: timeoutMs }, () => {
-        socket.destroy();
-        resolve();
+      let settled = false;
+      let buffer = "";
+      const rawChunks: Buffer[] = [];
+
+      const socket = net.createConnection({ host, port });
+      const timer = setTimeout(() => {
+        done(new Error(`Timed out (${Math.round(timeoutMs / 1000)}s)`));
+      }, timeoutMs);
+
+      const done = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          socket.destroy();
+        } catch {
+          // noop
+        }
+        if (err) reject(err);
+        else resolve();
+      };
+
+      socket.on("connect", () => {
+        if (proto === "http:" || proto === "https:") {
+          const headers = [
+            "CONNECT www.youtube.com:443 HTTP/1.1",
+            "Host: www.youtube.com:443",
+            "Proxy-Connection: keep-alive",
+          ];
+          if (parsed.username || parsed.password) {
+            const creds = `${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`;
+            headers.push(`Proxy-Authorization: Basic ${Buffer.from(creds).toString("base64")}`);
+          }
+          headers.push("", "");
+          socket.write(headers.join("\r\n"));
+          return;
+        }
+        if (proto === "socks5:" || proto === "socks5h:") {
+          const hasCreds = Boolean(parsed.username || parsed.password);
+          socket.write(hasCreds ? Buffer.from([0x05, 0x02, 0x00, 0x02]) : Buffer.from([0x05, 0x01, 0x00]));
+          return;
+        }
+        // socks4 / socks4a: verified TCP connect
+        done();
       });
-      socket.on("error", (e) => {
-        socket.destroy();
-        reject(e);
+
+      socket.on("data", (chunk: Buffer) => {
+        if (proto === "http:" || proto === "https:") {
+          buffer += chunk.toString("latin1");
+          const statusLine = buffer.split(/\r?\n/)[0] ?? "";
+          if (!statusLine && buffer.length < 16) return;
+          const m = statusLine.match(/^HTTP\/\d\.\d\s+(\d{3})/i);
+          if (m) {
+            const code = parseInt(m[1], 10);
+            if (code >= 200 && code < 300) {
+              done();
+            } else if (code === 407) {
+              done(new Error("407 Proxy Authentication Required"));
+            } else {
+              done(new Error(`Proxy rejected HTTPS tunnel (HTTP ${code})`));
+            }
+          } else if (buffer.length > 64) {
+            done(new Error("Invalid proxy HTTP CONNECT response"));
+          }
+          return;
+        }
+        if (proto === "socks5:" || proto === "socks5h:") {
+          rawChunks.push(chunk);
+          const merged = Buffer.concat(rawChunks);
+          if (merged.length >= 2) {
+            if (merged[0] !== 0x05) {
+              done(new Error("Invalid SOCKS5 proxy handshake"));
+            } else if (merged[1] === 0xff) {
+              done(new Error("SOCKS5 proxy rejected authentication method"));
+            } else {
+              done();
+            }
+          }
+        }
       });
-      socket.on("timeout", () => {
-        socket.destroy();
-        reject(new Error(`Timed out (${Math.round(timeoutMs / 1000)}s)`));
+
+      socket.on("end", () => {
+        if (!settled) {
+          done(new Error("Proxy closed tunnel connection without responding"));
+        }
       });
+
+      socket.on("error", (e) => done(e));
     });
-    return { ok: true, error: null };
+
+    const latencyMs = Math.max(1, Date.now() - startedAt);
+    recordProxySuccess(proxyUrl, latencyMs);
+    return { ok: true, latencyMs, error: null };
   } catch (err) {
     return {
       ok: false,
+      latencyMs: null,
       error: err instanceof Error ? err.message : "Failed to reach proxy host",
     };
   }
+}
+
+export interface ProxyPruneItem {
+  maskedHost: string;
+  templateEntry: string | null;
+  ok: boolean;
+  latencyMs: number | null;
+  error: string | null;
+}
+
+export interface ProxyPruneResult {
+  total: number;
+  workingCount: number;
+  removedCount: number;
+  workingProxies: string[];
+  results: ProxyPruneItem[];
+}
+
+export async function pruneAndRankProxyPool(proxyList: string[]): Promise<ProxyPruneResult> {
+  if (proxyList.length === 0) {
+    return { total: 0, workingCount: 0, removedCount: 0, workingProxies: [], results: [] };
+  }
+
+  const batchSize = 15;
+  const checked: Array<{
+    proxy: string;
+    maskedHost: string;
+    templateEntry: string | null;
+    ok: boolean;
+    latencyMs: number | null;
+    error: string | null;
+  }> = [];
+
+  for (let i = 0; i < proxyList.length; i += batchSize) {
+    const batch = proxyList.slice(i, i + batchSize);
+    const batchResults = await Promise.all(
+      batch.map(async (proxy) => {
+        const res = await checkProxyReachability(proxy, 3500);
+        if (!res.ok) {
+          recordProxyFailure(proxy);
+        }
+        return {
+          proxy,
+          maskedHost: maskProxyUrl(proxy),
+          templateEntry: getPublicTemplateEntry(proxy),
+          ok: res.ok,
+          latencyMs: res.latencyMs,
+          error: res.error,
+        };
+      })
+    );
+    checked.push(...batchResults);
+  }
+
+  const workingSorted = checked
+    .filter((c) => c.ok)
+    .sort((a, b) => (a.latencyMs ?? 99999) - (b.latencyMs ?? 99999));
+  const dead = checked.filter((c) => !c.ok);
+
+  const combined = [...workingSorted, ...dead];
+  return {
+    total: proxyList.length,
+    workingCount: workingSorted.length,
+    removedCount: dead.length,
+    workingProxies: workingSorted.map((c) => c.proxy),
+    results: combined.map(({ maskedHost, templateEntry, ok, latencyMs, error }) => ({
+      maskedHost,
+      templateEntry,
+      ok,
+      latencyMs,
+      error,
+    })),
+  };
 }
 
 function buildStrategies(hasCookies: boolean, hasPot: boolean): ClientStrategy[] {
@@ -426,7 +642,9 @@ export async function fetchYtDlpMetadataShared(url: string): Promise<YtDlpMeta> 
           ...(await checkProxyReachability(proxy, 2500)),
         }))
       );
-      const reachable = checks.filter((c) => c.ok).map((c) => c.proxy);
+      const reachable = rankAndFilterHealthyProxies(
+        checks.filter((c) => c.ok).map((c) => c.proxy)
+      );
       if (reachable.length === 0) {
         logger.warn({ url, configuredProxies: proxyList.length }, "No configured proxies reachable for metadata fetch");
         return {};
@@ -545,13 +763,23 @@ export async function downloadVideoWithResilience(options: {
   try {
     let activeProxyPool: Array<string | null> = [null];
     if (proxyList.length > 0) {
+      const autoPruneEnabled = await getProxyAutoPruneEnabled();
       const checks = await Promise.all(
         proxyList.map(async (proxy) => ({
           proxy,
-          ...(await checkProxyReachability(proxy, 3000)),
+          ...(await checkProxyReachability(proxy, 3500)),
         }))
       );
-      const reachableProxies = checks.filter((c) => c.ok).map((c) => c.proxy);
+      const deadProxies = checks.filter((c) => !c.ok).map((c) => c.proxy);
+      for (const deadProxy of deadProxies) {
+        recordProxyFailure(deadProxy);
+        if (autoPruneEnabled) {
+          await removeProxyFromStoredPool(deadProxy).catch(() => {});
+        }
+      }
+      const reachableProxies = rankAndFilterHealthyProxies(
+        checks.filter((c) => c.ok).map((c) => c.proxy)
+      );
       if (reachableProxies.length === 0) {
         const summaryHost =
           proxyList.length === 1
@@ -559,7 +787,7 @@ export async function downloadVideoWithResilience(options: {
             : `${maskProxyUrl(proxyList[0])} (+${proxyList.length - 1} more)`;
         throw new Error(
           classifyYtDlpError(
-            `ProxyError: None of the ${proxyList.length} configured proxies could be reached right now.`,
+            `ProxyError: None of the ${proxyList.length} configured proxies could reach YouTube HTTPS right now.`,
             {
               quality,
               usedCookies: cookieCopy.hasCookies,
@@ -570,7 +798,7 @@ export async function downloadVideoWithResilience(options: {
           ).formattedMessage
         );
       }
-      activeProxyPool = rotateProxyPool(reachableProxies);
+      activeProxyPool = reachableProxies.length > 1 ? reachableProxies : rotateProxyPool(reachableProxies);
     }
 
     for (let pIdx = 0; pIdx < activeProxyPool.length; pIdx++) {
@@ -664,6 +892,10 @@ export async function downloadVideoWithResilience(options: {
               }
             }
 
+            if (activeProxy) {
+              recordProxySuccess(activeProxy, null);
+            }
+
             logger.info(
               {
                 url,
@@ -705,6 +937,13 @@ export async function downloadVideoWithResilience(options: {
             }
 
             if (/ProxyError|Unable to connect to proxy|407 Proxy Authentication|SOCKS|proxyconnect|Connection reset by peer|Connection refused/i.test(lastError)) {
+              if (activeProxy) {
+                recordProxyFailure(activeProxy);
+                if (await getProxyAutoPruneEnabled()) {
+                  await removeProxyFromStoredPool(activeProxy).catch(() => {});
+                  logger.info({ proxy: maskedActiveProxy }, "Auto-pruned failing proxy from saved pool");
+                }
+              }
               if (hasMoreProxies) {
                 rotateToNextProxy = true;
                 break;
@@ -723,6 +962,11 @@ export async function downloadVideoWithResilience(options: {
             if (activeProxy && /timed out|TransportError|stalled/i.test(lastError)) {
               proxyTimeoutHits++;
               if (proxyTimeoutHits >= 2) {
+                const entry = recordProxyFailure(activeProxy);
+                if (entry.failCount >= 2 && (await getProxyAutoPruneEnabled())) {
+                  await removeProxyFromStoredPool(activeProxy).catch(() => {});
+                  logger.info({ proxy: maskedActiveProxy }, "Auto-pruned timed-out proxy from saved pool");
+                }
                 if (hasMoreProxies) {
                   rotateToNextProxy = true;
                   break;
@@ -850,7 +1094,7 @@ export interface DiagnosticsReport {
     count: number;
     reachableCount: number;
     maskedHost: string | null;
-    proxies: Array<{ maskedHost: string; ok: boolean; error: string | null }>;
+    proxies: Array<{ maskedHost: string; ok: boolean; latencyMs: number | null; error: string | null }>;
     ok: boolean | null;
     error: string | null;
   };
@@ -903,7 +1147,7 @@ export async function runYtDlpDiagnostics(opts: {
 
   let proxyOk: boolean | null = null;
   let proxyErr: string | null = null;
-  let proxyStatuses: Array<{ maskedHost: string; ok: boolean; error: string | null }> = [];
+  let proxyStatuses: Array<{ maskedHost: string; ok: boolean; latencyMs: number | null; error: string | null }> = [];
   let reachableProxies: string[] = [];
 
   if (proxyList.length > 0 && ytDlpVersion) {
@@ -914,18 +1158,26 @@ export async function runYtDlpDiagnostics(opts: {
         ...(await checkProxyReachability(proxy, 3500)),
       }))
     );
-    proxyStatuses = checks.map((c) => ({
-      maskedHost: c.maskedHost,
-      ok: c.ok,
-      error: c.error,
-    }));
-    reachableProxies = checks.filter((c) => c.ok).map((c) => c.proxy);
+    proxyStatuses = checks
+      .map((c) => ({
+        maskedHost: c.maskedHost,
+        ok: c.ok,
+        latencyMs: c.latencyMs,
+        error: c.error,
+      }))
+      .sort((a, b) => {
+        if (a.ok !== b.ok) return a.ok ? -1 : 1;
+        return (a.latencyMs ?? 99999) - (b.latencyMs ?? 99999);
+      });
+    reachableProxies = rankAndFilterHealthyProxies(
+      checks.filter((c) => c.ok).map((c) => c.proxy)
+    );
     proxyOk = reachableProxies.length > 0;
     if (!proxyOk) {
       proxyErr =
         proxyStatuses.length === 1
           ? proxyStatuses[0]?.error || "Failed to reach proxy host"
-          : `All ${proxyStatuses.length} proxies failed connection check (${proxyStatuses[0]?.error || "timed out"})`;
+          : `All ${proxyStatuses.length} proxies failed tunnel check (${proxyStatuses[0]?.error || "timed out"})`;
     }
   }
 

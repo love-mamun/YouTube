@@ -11,8 +11,23 @@ import {
   validateNetscapeCookies,
   parseAndValidateProxyList,
   getMaskedProxyStatus,
+  getStoredProxyList,
+  saveStoredProxyList,
+  removeProxyFromStoredPool,
+  setProxyAutoPruneEnabled,
 } from "../lib/ytdlp-config";
-import { runYtDlpDiagnostics } from "../lib/ytdlp-downloader";
+import { runYtDlpDiagnostics, pruneAndRankProxyPool } from "../lib/ytdlp-downloader";
+import {
+  BUILTIN_GITHUB_PROXY_FEEDS,
+  getLastScrapeReport,
+  getScraperTokenStatus,
+  getStoredScraperConfig,
+  isProxyScrapeRunning,
+  revokeScraperTriggerToken,
+  rotateScraperTriggerToken,
+  saveStoredScraperConfig,
+  validateScraperConfigInput,
+} from "../lib/proxy-scraper";
 
 const ASSETS_DIR     = path.resolve(process.cwd(), "artifacts/api-server/assets");
 const LOGO_FILE_PATH = path.join(ASSETS_DIR, "watermark-logo.png");
@@ -188,14 +203,8 @@ router.post("/settings/yt-proxy", requireSettingsAuth, async (req, res): Promise
     return;
   }
 
-  const storedValue = check.proxies.join("\n");
-  await db
-    .insert(appConfigTable)
-    .values({ key: YT_PROXY_DB_KEY, value: storedValue })
-    .onConflictDoUpdate({
-      target: appConfigTable.key,
-      set: { value: storedValue, updatedAt: new Date() },
-    });
+  await saveStoredProxyList(check.proxies);
+  const status = await getMaskedProxyStatus();
 
   res.json({
     ok: true,
@@ -203,12 +212,130 @@ router.post("/settings/yt-proxy", requireSettingsAuth, async (req, res): Promise
     count: check.proxies.length,
     maskedHost: check.summary,
     maskedProxies: check.maskedList,
+    autoPrune: status.autoPrune,
   });
+});
+
+// POST /api/settings/yt-proxy/prune — test proxies via HTTPS CONNECT & optionally keep working-only
+router.post("/settings/yt-proxy/prune", requireSettingsAuth, async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as {
+    proxyUrl?: string;
+    saveWorkingOnly?: boolean;
+  };
+
+  let targets: string[];
+  if (typeof body.proxyUrl === "string" && body.proxyUrl.trim()) {
+    const check = parseAndValidateProxyList(body.proxyUrl);
+    if (!check.ok) {
+      res.status(400).json({ error: check.error });
+      return;
+    }
+    targets = check.proxies;
+  } else {
+    targets = await getStoredProxyList();
+    if (targets.length === 0) {
+      res.status(400).json({ error: "No saved proxies found in pool to prune." });
+      return;
+    }
+  }
+
+  const pruneResult = await pruneAndRankProxyPool(targets);
+  let saved = false;
+  if (body.saveWorkingOnly === true && pruneResult.workingProxies.length > 0) {
+    await saveStoredProxyList(pruneResult.workingProxies);
+    saved = true;
+  }
+
+  const status = await getMaskedProxyStatus();
+  res.json({
+    total: pruneResult.total,
+    workingCount: pruneResult.workingCount,
+    removedCount: pruneResult.removedCount,
+    results: pruneResult.results,
+    saved,
+    status,
+  });
+});
+
+// POST /api/settings/yt-proxy/autoprune — toggle runtime auto-pruning of failing proxies
+router.post("/settings/yt-proxy/autoprune", requireSettingsAuth, async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { enabled?: unknown };
+  if (typeof body.enabled !== "boolean") {
+    res.status(400).json({ error: "Expected boolean { enabled }" });
+    return;
+  }
+  await setProxyAutoPruneEnabled(body.enabled);
+  res.json({ ok: true, autoPrune: body.enabled });
+});
+
+// DELETE /api/settings/yt-proxy/entry — remove a single proxy from saved pool
+router.delete("/settings/yt-proxy/entry", requireSettingsAuth, async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { index?: unknown; maskedHost?: unknown };
+  const idx =
+    typeof body.index === "number" && Number.isInteger(body.index) ? body.index : undefined;
+  const maskedHost = typeof body.maskedHost === "string" ? body.maskedHost.trim() : undefined;
+
+  if (idx === undefined && !maskedHost) {
+    res.status(400).json({ error: "Specify proxy index or maskedHost to remove." });
+    return;
+  }
+
+  const result = await removeProxyFromStoredPool({ index: idx, maskedHost });
+  const status = await getMaskedProxyStatus();
+  res.json({ ok: result.removed, ...result, status });
 });
 
 // DELETE /api/settings/yt-proxy — remove saved proxy
 router.delete("/settings/yt-proxy", requireSettingsAuth, async (_req, res): Promise<void> => {
   await db.delete(appConfigTable).where(eq(appConfigTable.key, YT_PROXY_DB_KEY));
+  res.sendStatus(204);
+});
+
+// ── GitHub Proxy Auto-Scraper Configuration & Trigger Token ──────────────────
+
+router.get("/settings/proxy-scraper", requireSettingsAuth, async (_req, res): Promise<void> => {
+  const [config, tokenStatus, lastRun] = await Promise.all([
+    getStoredScraperConfig(),
+    getScraperTokenStatus(),
+    getLastScrapeReport(),
+  ]);
+  res.json({
+    builtinFeeds: BUILTIN_GITHUB_PROXY_FEEDS,
+    enabledFeedIds: config.enabledFeedIds,
+    customUrls: config.customUrls,
+    tokenConfigured: tokenStatus.configured,
+    tokenUpdatedAt: tokenStatus.updatedAt,
+    lastRun,
+    running: isProxyScrapeRunning(),
+  });
+});
+
+router.put("/settings/proxy-scraper", requireSettingsAuth, async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { enabledFeedIds?: unknown; customUrls?: unknown };
+  const check = validateScraperConfigInput(body);
+  if (!check.ok) {
+    res.status(400).json({ error: check.error });
+    return;
+  }
+  await saveStoredScraperConfig(check.config);
+  res.json({
+    ok: true,
+    enabledFeedIds: check.config.enabledFeedIds,
+    customUrls: check.config.customUrls,
+  });
+});
+
+router.post("/settings/proxy-scraper/token/rotate", requireSettingsAuth, async (_req, res): Promise<void> => {
+  const rotated = await rotateScraperTriggerToken();
+  res.json({
+    ok: true,
+    token: rotated.token,
+    updatedAt: rotated.updatedAt,
+  });
+});
+
+router.delete("/settings/proxy-scraper/token", requireSettingsAuth, async (_req, res): Promise<void> => {
+  await revokeScraperTriggerToken();
   res.sendStatus(204);
 });
 

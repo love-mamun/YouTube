@@ -12,6 +12,7 @@ import {
   downloadVideoWithResilience,
   type YtDlpMeta,
 } from "./ytdlp-downloader";
+import { generateAiContent } from "./ai-content";
 import { getVideoStoreDir } from "./ytdlp-config";
 import { registerJobAbort, clearJobAbort } from "./job-registry";
 
@@ -205,6 +206,136 @@ function isPidAlive(pid: number): boolean {
  *     using the NK NOVAKING ENTERTAINMENT PNG; falls back to drawtext if logo missing
  *   - Re-encode with libx264 + AAC
  */
+export type AspectMode = "source" | "vertical_blur" | "vertical_crop";
+
+export interface ShortFormPipelineOptions {
+  aspectMode?: AspectMode | string | null;
+  clipStartSecs?: number | null;
+  clipMaxSecs?: number | null;
+  audioNormalize?: string | null;
+  applyCopyrightSuite?: boolean;
+}
+
+export function jobNeedsFfmpegPipeline(job: {
+  quality?: string | null;
+  missionType?: string | null;
+  aspectMode?: string | null;
+  clipStartSecs?: number | null;
+  clipMaxSecs?: number | null;
+  audioNormalize?: string | null;
+}): boolean {
+  if (!job.quality) return false;
+  if (job.missionType === "4k") return true;
+  if (job.aspectMode === "vertical_blur" || job.aspectMode === "vertical_crop") return true;
+  if (job.clipStartSecs != null && job.clipStartSecs > 0) return true;
+  if (job.clipMaxSecs != null && job.clipMaxSecs > 0) return true;
+  if (job.audioNormalize === "loudnorm") return true;
+  return false;
+}
+
+export function buildShortFormVideoFilter(options: {
+  aspectMode?: AspectMode | string | null;
+  quality: string;
+  isPortrait?: boolean;
+  applyCopyrightSuite?: boolean;
+  watermarkText?: string;
+  hasLogo?: boolean;
+  logoInputIdx?: number;
+}): { filterComplex: string | null; videoFilter: string | null; outW: number } {
+  const {
+    aspectMode = "source",
+    quality,
+    isPortrait = false,
+    applyCopyrightSuite = false,
+    watermarkText = "NovaKing",
+    hasLogo = false,
+  } = options;
+
+  const isVertical = aspectMode === "vertical_blur" || aspectMode === "vertical_crop";
+  const res = RESOLUTION_SETTINGS[quality] ?? RESOLUTION_SETTINGS["1080p"];
+  const verticalW = quality === "4k" ? 2160 : 1080;
+  const verticalH = quality === "4k" ? 3840 : 1920;
+
+  const outW = isVertical ? verticalW : isPortrait ? res.h : res.w;
+  const targetScale = isPortrait ? `${res.h}:${res.w}` : res.scale;
+
+  const preSteps: string[] = [];
+  if (applyCopyrightSuite) {
+    preSteps.push(
+      "setpts=0.98*PTS",
+      "hue=h=1.8",
+      "eq=brightness=0.02:contrast=1.02:saturation=1.05",
+      "unsharp=5:5:0.4:5:5:0.0"
+    );
+  }
+
+  // Watermark overlay / drawtext runs ONLY when applyCopyrightSuite is enabled (4K missions)
+  const useWatermarkLogo = applyCopyrightSuite && hasLogo;
+  const useWatermarkText = applyCopyrightSuite && !hasLogo;
+  const safeText = watermarkText.replace(/'/g, "'\\''");
+  const drawTextFilter = `drawtext=fontfile='${FONT_FILE}':text='${safeText}':fontsize=72:fontcolor=white@0.5:x=(w-text_w)/2:y=h-text_h-60`;
+
+  if (aspectMode === "vertical_blur") {
+    const preChain = preSteps.length > 0 ? `[0:v]${preSteps.join(",")}[pre];[pre]` : "[0:v]";
+    const chains = [
+      `${preChain}split=2[fg_src][bg_src]`,
+      `[bg_src]scale=${verticalW}:${verticalH}:force_original_aspect_ratio=increase,crop=${verticalW}:${verticalH},gblur=sigma=28,eq=brightness=-0.06[bg]`,
+      `[fg_src]scale=${verticalW}:${verticalH}:force_original_aspect_ratio=decrease[fg]`,
+    ];
+
+    if (useWatermarkLogo) {
+      const logoW = Math.floor(outW * 0.16);
+      const padding = Math.floor(outW * 0.012);
+      chains.push(
+        `[1:v]scale=${logoW}:-1:flags=lanczos,split=2[wm1][wm2]`,
+        `[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[base]`,
+        `[base][wm1]overlay=main_w-overlay_w-${padding}:${padding}[v1]`,
+        `[v1][wm2]overlay=${padding}:main_h-overlay_h-${padding}[vout]`
+      );
+    } else if (useWatermarkText) {
+      chains.push(`[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,${drawTextFilter}[vout]`);
+    } else {
+      chains.push(`[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[vout]`);
+    }
+
+    return { filterComplex: chains.join(";"), videoFilter: null, outW };
+  }
+
+  const singleSteps = [...preSteps];
+  if (aspectMode === "vertical_crop") {
+    singleSteps.push(
+      `crop='min(iw\\,ih*9/16)':'min(ih\\,iw*16/9)':(iw-min(iw\\,ih*9/16))/2:(ih-min(ih\\,iw*16/9))/2`,
+      `scale=${verticalW}:${verticalH}:flags=lanczos`,
+      `setsar=1`
+    );
+  } else {
+    singleSteps.push(`scale=${targetScale}:flags=lanczos`);
+    if (applyCopyrightSuite) {
+      singleSteps.push("crop=iw-2:ih-2");
+    } else {
+      singleSteps.push("setsar=1");
+    }
+  }
+
+  if (useWatermarkLogo) {
+    const logoW = Math.floor(outW * 0.16);
+    const padding = Math.floor(outW * 0.012);
+    const filterComplex = [
+      `[1:v]scale=${logoW}:-1:flags=lanczos,split=2[wm1][wm2]`,
+      `[0:v]${singleSteps.join(",")}[base]`,
+      `[base][wm1]overlay=main_w-overlay_w-${padding}:${padding}[v1]`,
+      `[v1][wm2]overlay=${padding}:main_h-overlay_h-${padding}[vout]`,
+    ].join(";");
+    return { filterComplex, videoFilter: null, outW };
+  }
+
+  if (useWatermarkText) {
+    singleSteps.push(drawTextFilter);
+  }
+
+  return { filterComplex: null, videoFilter: singleSteps.join(","), outW };
+}
+
 async function processWithFFmpegPipeline(
   inputPath: string,
   outputPath: string,
@@ -214,109 +345,90 @@ async function processWithFFmpegPipeline(
   onProgress?: (pct: number) => void,
   jobId?: number,
   signal?: AbortSignal,
-  isPortrait = false
+  isPortrait = false,
+  shortOpts: ShortFormPipelineOptions = {}
 ): Promise<void> {
   const res = RESOLUTION_SETTINGS[quality] ?? RESOLUTION_SETTINGS["1080p"];
-  const scale = isPortrait ? `${res.h}:${res.w}` : res.scale;
-  const outW = isPortrait ? res.h : res.w;
   const { bitrate } = res;
   const is4k = quality === "4k";
+  const applyCopyrightSuite = shortOpts.applyCopyrightSuite ?? is4k;
   const ffmpegPreset = is4k ? "veryfast" : "medium";
   const threadArgs = is4k ? ["-threads", "2"] : [];
-  const audioFilter = "atempo=1.02,asetrate=44982,aresample=44100";
   const progFile = jobId ? progressFilePath(jobId) : null;
 
-  const logoExists = existsSync(LOGO_PATH);
-  logger.info({ jobId, quality, logoExists, LOGO_PATH }, "Building FFmpeg pipeline");
-
-  let args: string[];
-
-  if (logoExists) {
-    // ── Logo in top-right AND bottom-left corners ──────────────────────────────
-    // Logo is scaled to 16% of the output video width (clearly visible).
-    const logoW = Math.floor(outW * 0.16);
-    const padding = Math.floor(outW * 0.012); // ~1.2% padding from edges
-
-    // Copyright-avoidance video filters applied before watermark:
-    //   setpts=0.98          → 2% speed-up shifts timestamps
-    //   hue=h=1.8            → 1.8° hue rotation (imperceptible, breaks color hash)
-    //   eq=brightness=0.02:
-    //      contrast=1.02:
-    //      saturation=1.05   → micro brightness/contrast/saturation tweak
-    //   unsharp=5:5:0.4:     → mild luma sharpening alters per-pixel values
-    //      5:5:0.0
-    //   scale + crop         → resize to target + remove 2px border artifacts
-    const videoProc = [
-      `setpts=0.98*PTS`,
-      `hue=h=1.8`,
-      `eq=brightness=0.02:contrast=1.02:saturation=1.05`,
-      `unsharp=5:5:0.4:5:5:0.0`,
-      `scale=${scale}:flags=lanczos`,
-      `crop=iw-2:ih-2`,
-    ].join(",");
-
-    // filter_complex:
-    //  [1:v]  = logo PNG input
-    //  scale logo → split into two copies
-    //  process main video → overlay wm1 (top-right) → overlay wm2 (bottom-left)
-    const filterComplex = [
-      `[1:v]scale=${logoW}:-1:flags=lanczos,split=2[wm1][wm2]`,
-      `[0:v]${videoProc}[base]`,
-      `[base][wm1]overlay=main_w-overlay_w-${padding}:${padding}[v1]`,
-      `[v1][wm2]overlay=${padding}:main_h-overlay_h-${padding}[vout]`,
-    ].join(";");
-
-    args = [
-      "-y",
-      "-i", inputPath,
-      "-i", LOGO_PATH,
-      "-map_metadata", "-1",
-      "-filter_complex", filterComplex,
-      "-map", "[vout]",
-      "-map", "0:a?",  // include audio if present
-      "-af", audioFilter,
-      "-c:v", "libx264",
-      "-b:v", bitrate,
-      "-preset", ffmpegPreset,
-      ...threadArgs,
-      "-crf", "18",
-      "-c:a", "aac",
-      "-b:a", "192k",
-      "-movflags", "+faststart",
-      ...(progFile ? ["-progress", progFile] : []),
-      outputPath,
-    ];
-  } else {
-    // ── Fallback: center-bottom text watermark ─────────────────────────────────
-    const safeText = watermarkText.replace(/'/g, "'\\''");
-    const videoFilter = [
-      "setpts=0.98*PTS",
-      "hue=h=1.8",
-      "eq=brightness=0.02:contrast=1.02:saturation=1.05",
-      "unsharp=5:5:0.4:5:5:0.0",
-      `scale=${scale}:flags=lanczos`,
-      "crop=iw-2:ih-2",
-      `drawtext=fontfile='${FONT_FILE}':text='${safeText}':fontsize=72:fontcolor=white@0.5:x=(w-text_w)/2:y=h-text_h-60`,
-    ].join(",");
-
-    args = [
-      "-y",
-      "-i", inputPath,
-      "-map_metadata", "-1",
-      "-vf", videoFilter,
-      "-af", audioFilter,
-      "-c:v", "libx264",
-      "-b:v", bitrate,
-      "-preset", ffmpegPreset,
-      ...threadArgs,
-      "-crf", "18",
-      "-c:a", "aac",
-      "-b:a", "192k",
-      "-movflags", "+faststart",
-      ...(progFile ? ["-progress", progFile] : []),
-      outputPath,
-    ];
+  const audioFilters: string[] = [];
+  if (applyCopyrightSuite) {
+    audioFilters.push("atempo=1.02", "asetrate=44982", "aresample=44100");
   }
+  if (shortOpts.audioNormalize === "loudnorm") {
+    audioFilters.push("loudnorm=I=-14:TP=-1.5:LRA=11");
+  }
+
+  const logoExists = existsSync(LOGO_PATH);
+  const useWatermarkLogoInput = applyCopyrightSuite && logoExists;
+
+  const graph = buildShortFormVideoFilter({
+    aspectMode: shortOpts.aspectMode ?? "source",
+    quality,
+    isPortrait,
+    applyCopyrightSuite,
+    watermarkText,
+    hasLogo: logoExists,
+  });
+
+  const clipStart =
+    shortOpts.clipStartSecs != null && shortOpts.clipStartSecs > 0
+      ? shortOpts.clipStartSecs
+      : null;
+  const clipMax =
+    shortOpts.clipMaxSecs != null && shortOpts.clipMaxSecs > 0
+      ? shortOpts.clipMaxSecs
+      : null;
+
+  let effectiveDuration = durationSecs;
+  if (effectiveDuration && clipStart) {
+    effectiveDuration = Math.max(1, effectiveDuration - clipStart);
+  }
+  if (clipMax) {
+    effectiveDuration = effectiveDuration ? Math.min(effectiveDuration, clipMax) : clipMax;
+  }
+
+  logger.info(
+    {
+      jobId,
+      quality,
+      aspectMode: shortOpts.aspectMode ?? "source",
+      clipStart,
+      clipMax,
+      audioNormalize: shortOpts.audioNormalize ?? null,
+      applyCopyrightSuite,
+      useWatermarkLogoInput,
+    },
+    "Building FFmpeg pipeline"
+  );
+
+  const args: string[] = [
+    "-y",
+    ...(clipStart ? ["-ss", String(clipStart)] : []),
+    "-i", inputPath,
+    ...(useWatermarkLogoInput ? ["-i", LOGO_PATH] : []),
+    "-map_metadata", "-1",
+    ...(graph.filterComplex
+      ? ["-filter_complex", graph.filterComplex, "-map", "[vout]", "-map", "0:a?"]
+      : ["-vf", graph.videoFilter!]),
+    ...(audioFilters.length > 0 ? ["-af", audioFilters.join(",")] : []),
+    "-c:v", "libx264",
+    ...(is4k || graph.filterComplex ? ["-b:v", bitrate] : []),
+    "-preset", ffmpegPreset,
+    ...threadArgs,
+    "-crf", "19",
+    "-c:a", "aac",
+    "-b:a", "192k",
+    ...(clipMax ? ["-t", String(clipMax)] : []),
+    "-movflags", "+faststart",
+    ...(progFile ? ["-progress", progFile] : []),
+    outputPath,
+  ];
 
   if (signal?.aborted) {
     throw new Error("[CANCELLED] Stopped by user");
@@ -356,11 +468,11 @@ async function processWithFFmpegPipeline(
     signal?.addEventListener("abort", onAbort, { once: true });
 
     // Poll the -progress file every 3s for progress updates
-    if (onProgress && durationSecs && durationSecs > 0 && progFile) {
+    if (onProgress && effectiveDuration && effectiveDuration > 0 && progFile) {
       pollInterval = setInterval(() => {
         const elapsed = readFFmpegProgressSecs(jobId!);
         if (elapsed !== null) {
-          const pct = Math.min(100, Math.floor((elapsed / durationSecs) * 100));
+          const pct = Math.min(100, Math.floor((elapsed / effectiveDuration) * 100));
           if (pct > lastReportedPct) {
             lastReportedPct = pct;
             onProgress(pct);
@@ -679,8 +791,7 @@ export async function startVideoProcessing(
 
   // Any quality set = download the actual video file
   const isDownloadJob = !!jobQuality;
-  // FFmpeg only for 4K Mission jobs — Normal Mission publishes the download directly
-  const needsFFmpegPipeline = isDownloadJob && jobRow0?.missionType === "4k";
+  const needsFFmpegPipeline = jobNeedsFfmpegPipeline(jobRow0 ?? {});
 
   try {
     // ── Stage 1: Fetch metadata ──────────────────────────────────────────────
@@ -785,7 +896,14 @@ export async function startVideoProcessing(
           },
           jobId,
           jobAbort.signal,
-          mediaInfo.isPortrait
+          mediaInfo.isPortrait,
+          {
+            aspectMode: jobRow0?.aspectMode ?? "source",
+            clipStartSecs: jobRow0?.clipStartSecs ?? null,
+            clipMaxSecs: jobRow0?.clipMaxSecs ?? null,
+            audioNormalize: jobRow0?.audioNormalize ?? null,
+            applyCopyrightSuite: jobRow0?.missionType === "4k",
+          }
         );
 
         tryUnlink(rawPath);
@@ -793,7 +911,7 @@ export async function startVideoProcessing(
         await updateJob(jobId, { videoPath: outPath, progress: 73 });
         logger.info({ jobId, outPath, quality: jobQuality }, "FFmpeg pipeline complete");
       } else {
-        // 360p–1080p: publish the downloaded file directly, no re-encoding
+        // 360p–1080p without short-form transforms: publish downloaded file directly
         processedVideoPath = rawPath;
         await updateJob(jobId, { videoPath: rawPath, progress: 73 });
         logger.info({ jobId, rawPath, quality: jobQuality }, "FFmpeg skipped — using raw download for publish");
@@ -809,16 +927,49 @@ export async function startVideoProcessing(
       await sleep(1000);
     }
 
-    // ── Stage 4: Populate content from metadata ──────────────────────────────
+    // ── Stage 4: Populate content (AI Short-Form copy when Shorts/vertical targeted) ──
     const originalTags = Array.isArray(meta.tags) && meta.tags.length > 0
       ? meta.tags.slice(0, 30).join(", ")
       : null;
 
+    const jobPlatforms = (jobRow0?.platforms ?? "youtube")
+      .split(",")
+      .map((p: string) => p.trim())
+      .filter(Boolean);
+    const isShortFormJob =
+      jobPlatforms.includes("youtube-shorts") ||
+      jobRow0?.aspectMode === "vertical_blur" ||
+      jobRow0?.aspectMode === "vertical_crop";
+
+    let finalTitle = originalTitle;
+    let finalDescription = originalDescription;
+    let finalTags = originalTags;
+    let finalHashtags: string | null = null;
+
+    if (isShortFormJob) {
+      await updateJob(jobId, { status: "generating", progress: 82 });
+      try {
+        const aiCopy = await generateAiContent(
+          originalTitle,
+          originalDescription ?? undefined,
+          undefined,
+          originalTags ?? undefined,
+          { copyStyle: "short", platforms: jobPlatforms }
+        );
+        finalTitle = aiCopy.title || originalTitle;
+        finalDescription = aiCopy.description || originalDescription;
+        finalTags = aiCopy.tags || originalTags;
+        finalHashtags = aiCopy.hashtags || null;
+      } catch (aiErr) {
+        logger.warn({ err: aiErr, jobId }, "Short-form AI generation fell back to original metadata");
+      }
+    }
+
     await updateJob(jobId, {
-      title: originalTitle,
-      description: originalDescription,
-      tags: originalTags,
-      hashtags: null,
+      title: finalTitle,
+      description: finalDescription,
+      tags: finalTags,
+      hashtags: finalHashtags,
       progress: 90,
     });
 
@@ -893,7 +1044,7 @@ export async function resumeStuckJobs(): Promise<void> {
     const storeDir = getVideoStoreDir();
     const rawPath       = path.join(storeDir, `job-${jobId}-raw.mp4`);
     const processedPath = path.join(storeDir, `job-${jobId}-processed.mp4`);
-    const needsFFmpeg   = job.missionType === "4k" && !!job.quality;
+    const needsFFmpeg   = jobNeedsFfmpegPipeline(job);
 
     // ── Case 1: FFmpeg is still alive (survived server restart) ──────────────
     const pidFile = pidFilePath(jobId);

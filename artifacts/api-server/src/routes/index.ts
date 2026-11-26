@@ -12,6 +12,7 @@ import facebookAuthRouter from "./facebook-auth";
 import settingsRouter from "./settings";
 import youtubeApiRouter from "./youtube-api";
 import authRouter from "./auth";
+import proxyScraperRouter from "./proxy-scraper";
 import { requireSettingsAuth } from "../middlewares/auth";
 
 const router: IRouter = Router();
@@ -19,6 +20,8 @@ const router: IRouter = Router();
 router.use(healthRouter);
 // Auth endpoints (login/logout/status/change-password) — public
 router.use(authRouter);
+// External API trigger for GitHub proxy auto-scraper (authenticated via trigger token or session)
+router.use(proxyScraperRouter);
 
 // Everything below requires settings auth ─────────────────────────────────
 router.use(requireSettingsAuth, youtubeAuthRouter);

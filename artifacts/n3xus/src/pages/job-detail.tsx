@@ -44,6 +44,7 @@ import {
   Square,
   RotateCcw,
   Image as ImageIcon,
+  Sparkles,
 } from "lucide-react";
 import { parseJobErrorDiagnostic } from "@/lib/ytdlp-errors";
 
@@ -168,6 +169,60 @@ export default function JobDetail() {
     mutation: { onSuccess: invalidate },
   });
   const [cancelling, setCancelling] = useState(false);
+  const [copyStyle, setCopyStyle] = useState<"short" | "long">("long");
+  const styleInitializedRef = useRef(false);
+  const [regenerating, setRegenerating] = useState(false);
+  const [regenError, setRegenError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!job || styleInitializedRef.current) return;
+    styleInitializedRef.current = true;
+    const extJob = job as typeof job & { aspectMode?: string | null };
+    const isShortTarget =
+      (job.platforms ?? "").includes("youtube-shorts") ||
+      extJob.aspectMode === "vertical_blur" ||
+      extJob.aspectMode === "vertical_crop" ||
+      (job.duration != null && job.duration > 0 && job.duration <= 65);
+    setCopyStyle(isShortTarget ? "short" : "long");
+  }, [job]);
+
+  const handleRegenerateCopy = async () => {
+    if (!jobId || regenerating) return;
+    setRegenerating(true);
+    setRegenError(null);
+    try {
+      const res = await fetch(`${BASE}/api/jobs/${jobId}/regenerate-content`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ copyStyle }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        title?: string | null;
+        description?: string | null;
+        tags?: string | null;
+        hashtags?: string | null;
+      };
+      if (!res.ok) {
+        setRegenError(data.error ?? `AI regeneration failed (${res.status})`);
+        return;
+      }
+      clearTimeout(autoSaveTimer.current);
+      isDirty.current = false;
+      setTitle(data.title || "");
+      setDescription(data.description || "");
+      setTags(data.tags || "");
+      setHashtags(data.hashtags || "");
+      setAutoSaveStatus("saved");
+      setTimeout(() => setAutoSaveStatus("idle"), 2000);
+      invalidate();
+    } catch {
+      setRegenError("Network error generating AI copy.");
+    } finally {
+      setRegenerating(false);
+    }
+  };
 
   const handleCancelJob = async () => {
     if (!jobId || cancelling) return;
@@ -305,6 +360,34 @@ export default function JobDetail() {
                 <StatusBadge status={job.status} />
                 <span aria-hidden="true">·</span>
                 <span>{detectPlatformLabel(job.youtubeUrl)}</span>
+                {(() => {
+                  const extJob = job as typeof job & {
+                    aspectMode?: string | null;
+                    clipMaxSecs?: number | null;
+                  };
+                  const aspectLabel =
+                    extJob.aspectMode === "vertical_blur"
+                      ? "9:16 Blur"
+                      : extJob.aspectMode === "vertical_crop"
+                      ? "9:16 Crop"
+                      : null;
+                  return (
+                    <>
+                      {aspectLabel && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-primary">{aspectLabel}</span>
+                        </>
+                      )}
+                      {extJob.clipMaxSecs && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="tabular-nums">Max {extJob.clipMaxSecs}s</span>
+                        </>
+                      )}
+                    </>
+                  );
+                })()}
                 {job.youtubeUrl && (
                   <>
                     <span aria-hidden="true">·</span>
@@ -506,23 +589,76 @@ export default function JobDetail() {
           {/* Left: Metadata & Copy */}
           <Card className="p-4 sm:p-6 border-border bg-card flex flex-col justify-between space-y-4">
             <div className="space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <h2 className="text-base font-display font-semibold text-foreground">
-                  Metadata & Copy
-                </h2>
-                {autoSaveStatus !== "idle" && (
-                  <div className="flex items-center gap-1.5 text-xs font-mono">
-                    {autoSaveStatus === "saving" ? (
-                      <>
-                        <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />
-                        <span className="text-muted-foreground">Saving…</span>
-                      </>
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h2 className="text-base font-display font-semibold text-foreground">
+                    Metadata &amp; Copy
+                  </h2>
+                  {autoSaveStatus !== "idle" && (
+                    <div className="flex items-center gap-1.5 text-xs font-mono">
+                      {autoSaveStatus === "saving" ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />
+                          <span className="text-muted-foreground">Saving…</span>
+                        </>
+                      ) : (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          <span className="text-emerald-400">Saved</span>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="inline-flex rounded-lg border border-border bg-muted/35 p-0.5">
+                    {(
+                      [
+                        { id: "short", label: "Shorts / Reels" },
+                        { id: "long", label: "Long-Form SEO" },
+                      ] as const
+                    ).map((mode) => (
+                      <button
+                        key={mode.id}
+                        type="button"
+                        onClick={() => setCopyStyle(mode.id)}
+                        className={`px-3 min-h-[36px] rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                          copyStyle === mode.id
+                            ? "bg-card text-foreground shadow-sm border border-border/80"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={handleRegenerateCopy}
+                    disabled={regenerating || isActive}
+                    className="gap-1.5 text-xs font-medium min-h-[38px] border-border bg-muted/40 hover:bg-muted whitespace-nowrap shrink-0"
+                  >
+                    {regenerating ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
                     ) : (
-                      <>
-                        <Check className="w-3.5 h-3.5 text-emerald-400" />
-                        <span className="text-emerald-400">Saved</span>
-                      </>
+                      <Sparkles className="w-3.5 h-3.5 text-primary" />
                     )}
+                    {regenerating
+                      ? "Generating…"
+                      : copyStyle === "short"
+                      ? "Remix Shorts Hook"
+                      : "Generate SEO Copy"}
+                  </Button>
+                </div>
+
+                {regenError && (
+                  <div className="flex items-center gap-2 text-xs text-red-300 bg-red-500/10 border border-red-500/25 rounded-lg p-2.5">
+                    <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                    <span>{regenError}</span>
                   </div>
                 )}
               </div>
@@ -533,7 +669,12 @@ export default function JobDetail() {
                     <Label className="text-xs font-medium text-muted-foreground">
                       Title
                     </Label>
-                    <div className="flex items-center gap-1">
+                    <div className="flex items-center gap-1.5">
+                      {copyStyle === "short" && title.length > 68 && (
+                        <span className="text-[11px] font-mono text-amber-400">
+                          Mobile cut-off &gt;68
+                        </span>
+                      )}
                       <span
                         className={`text-xs font-mono tabular-nums ${
                           title.length > 100

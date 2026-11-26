@@ -1,13 +1,21 @@
 import { Router, type IRouter } from "express";
 import { eq } from "drizzle-orm";
+import * as zod from "zod";
 import { db, videoJobsTable } from "@workspace/db";
 import {
   GetJobContentParams,
   UpdateJobContentParams,
   UpdateJobContentBody,
+  RegenerateContentParams,
 } from "@workspace/api-zod";
+import { generateAiContent, type AiCopyStyle } from "../lib/ai-content";
 
 const router: IRouter = Router();
+
+const RegenerateContentBodySchema = zod.object({
+  copyStyle: zod.enum(["short", "long"]).optional(),
+  feedback: zod.string().max(500).optional(),
+});
 
 router.get("/jobs/:id/content", async (req, res): Promise<void> => {
   const params = GetJobContentParams.safeParse(req.params);
@@ -79,6 +87,73 @@ router.put("/jobs/:id/content", async (req, res): Promise<void> => {
     description: newDescription,
     tags: newTags,
     hashtags: newHashtags,
+  });
+});
+
+router.post("/jobs/:id/regenerate-content", async (req, res): Promise<void> => {
+  const params = RegenerateContentParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: "Invalid job ID" });
+    return;
+  }
+
+  const bodyParsed = RegenerateContentBodySchema.safeParse(req.body ?? {});
+  if (!bodyParsed.success) {
+    res.status(400).json({ error: bodyParsed.error.message });
+    return;
+  }
+
+  const [job] = await db
+    .select()
+    .from(videoJobsTable)
+    .where(eq(videoJobsTable.id, params.data.id));
+
+  if (!job) {
+    res.status(404).json({ error: "Job not found" });
+    return;
+  }
+
+  const platforms = (job.platforms ?? "youtube")
+    .split(",")
+    .map((p: string) => p.trim())
+    .filter(Boolean);
+
+  const isVertical =
+    job.aspectMode === "vertical_blur" || job.aspectMode === "vertical_crop";
+  const inferredStyle: AiCopyStyle =
+    bodyParsed.data.copyStyle ??
+    (platforms.includes("youtube-shorts") ||
+    isVertical ||
+    (job.duration != null && job.duration > 0 && job.duration <= 65)
+      ? "short"
+      : "long");
+
+  const generated = await generateAiContent(
+    job.originalTitle || job.title || "Untitled Video",
+    job.originalDescription ?? job.description ?? undefined,
+    bodyParsed.data.feedback,
+    job.tags ?? undefined,
+    { copyStyle: inferredStyle, platforms }
+  );
+
+  await db
+    .update(videoJobsTable)
+    .set({
+      title: generated.title,
+      description: generated.description,
+      tags: generated.tags,
+      hashtags: generated.hashtags,
+      updatedAt: new Date(),
+    })
+    .where(eq(videoJobsTable.id, job.id));
+
+  res.json({
+    jobId: job.id,
+    title: generated.title,
+    description: generated.description,
+    tags: generated.tags,
+    hashtags: generated.hashtags,
+    copyStyle: inferredStyle,
   });
 });
 
