@@ -1,190 +1,99 @@
 import { cn } from "@/lib/utils";
-import { CheckCircle2, Download, Clapperboard, Upload } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
-
-type VideoJobStatus =
-  | "pending" | "downloading" | "processing" | "generating"
-  | "ready" | "approved" | "publishing" | "published" | "failed";
+import { Check, Download, Clapperboard, Upload, AlertCircle } from "lucide-react";
 
 const PIPELINE_STEPS = [
-  { id: "pending",     label: "Init",     short: "INIT" },
-  { id: "downloading", label: "Download", short: "DL"   },
-  { id: "processing",  label: "Process",  short: "PROC" },
-  { id: "ready",       label: "Ready",    short: "RDY"  },
-  { id: "approved",    label: "Approved", short: "APPR" },
-  { id: "publishing",  label: "Publish",  short: "PUB"  },
-  { id: "published",   label: "Done",     short: "DONE" },
+  { id: "pending", label: "Queue", short: "1" },
+  { id: "downloading", label: "Download", short: "2" },
+  { id: "processing", label: "Process", short: "3" },
+  { id: "ready", label: "Review", short: "4" },
+  { id: "approved", label: "Approved", short: "5" },
+  { id: "publishing", label: "Publish", short: "6" },
+  { id: "published", label: "Published", short: "7" },
 ];
 
-/** Maps overall job progress (0-100) to a per-stage sub-percentage */
 function computeSubProgress(status: string, progress: number): number {
   switch (status) {
     case "downloading":
-      // download spans overall progress 20-42
       return Math.round(Math.min(100, Math.max(0, ((progress - 20) / 22) * 100)));
     case "processing":
-      // ffmpeg spans overall progress 45-72
       return Math.round(Math.min(100, Math.max(0, ((progress - 45) / 27) * 100)));
     case "generating":
-      // AI gen spans overall progress 75-88
       return Math.round(Math.min(100, Math.max(0, ((progress - 75) / 13) * 100)));
     case "publishing":
-      // publish spans overall progress 80-100
       return Math.round(Math.min(100, Math.max(0, ((progress - 80) / 20) * 100)));
     default:
       return progress;
   }
 }
 
-const STAGE_CONFIG: Record<string, {
-  icon: React.ReactNode;
-  label: string;
-  sublabel: string;
-  color: string;
-  barColor: string;
-  glowColor: string;
-  scanColor: string;
-}> = {
+const STAGE_META: Record<
+  string,
+  { icon: typeof Download; label: string; sublabel: string; barClass: string; textClass: string }
+> = {
   downloading: {
-    icon: <Download className="w-3.5 h-3.5" />,
-    label: "DOWNLOADING VIDEO",
-    sublabel: "Fetching from YouTube CDN via yt-dlp",
-    color: "text-cyan-400",
-    barColor: "bg-cyan-400",
-    glowColor: "shadow-[0_0_12px_rgba(0,212,255,0.6)]",
-    scanColor: "from-cyan-400/0 via-cyan-200/60 to-cyan-400/0",
+    icon: Download,
+    label: "Downloading video stream",
+    sublabel: "Fetching source media from YouTube via yt-dlp",
+    barClass: "bg-primary",
+    textClass: "text-primary",
   },
   processing: {
-    icon: <Clapperboard className="w-3.5 h-3.5" />,
-    label: "ENCODING VIDEO",
-    sublabel: "FFmpeg pipeline — re-encoding & watermarking",
-    color: "text-amber-400",
-    barColor: "bg-amber-400",
-    glowColor: "shadow-[0_0_12px_rgba(251,191,36,0.5)]",
-    scanColor: "from-amber-400/0 via-amber-200/60 to-amber-400/0",
+    icon: Clapperboard,
+    label: "Encoding with FFmpeg",
+    sublabel: "Scaling, audio normalization, metadata strip & watermark",
+    barClass: "bg-amber-400",
+    textClass: "text-amber-300",
   },
   publishing: {
-    icon: <Upload className="w-3.5 h-3.5" />,
-    label: "UPLOADING TO PLATFORMS",
-    sublabel: "Pushing video to YouTube / Facebook",
-    color: "text-green-400",
-    barColor: "bg-green-400",
-    glowColor: "shadow-[0_0_12px_rgba(74,222,128,0.5)]",
-    scanColor: "from-green-400/0 via-green-200/60 to-green-400/0",
+    icon: Upload,
+    label: "Uploading to destination",
+    sublabel: "Sending video & metadata to selected platform",
+    barClass: "bg-emerald-400",
+    textClass: "text-emerald-300",
   },
 };
 
 function StageProgressPanel({ status, progress }: { status: string; progress: number }) {
-  const baseCfg = STAGE_CONFIG[status];
-  if (!baseCfg) return null;
+  const base = STAGE_META[status];
+  if (!base) return null;
 
   const isPreparingPublish = status === "publishing" && progress < 89;
   const cfg = isPreparingPublish
     ? {
-        ...baseCfg,
-        icon: <Download className="w-3.5 h-3.5" />,
-        label: "PREPARING VIDEO FOR UPLOAD",
-        sublabel: "Downloading source video before platform upload",
+        icon: Download,
+        label: "Preparing source video for upload",
+        sublabel: "Downloading selected stream before platform upload",
+        barClass: "bg-primary",
+        textClass: "text-primary",
       }
-    : baseCfg;
+    : base;
 
+  const Icon = cfg.icon;
   const subPct = computeSubProgress(status, progress);
   const isIndeterminate = status === "generating" && subPct < 5;
 
   return (
-    <AnimatePresence mode="wait">
-      <motion.div
-        key={status}
-        initial={{ opacity: 0, y: -6 }}
-        animate={{ opacity: 1, y: 0 }}
-        exit={{ opacity: 0, y: 6 }}
-        transition={{ duration: 0.25 }}
-        className="mt-4 rounded-lg border border-border/60 bg-card/60 backdrop-blur-sm overflow-hidden"
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-4 py-2.5 border-b border-border/40">
-          <div className={cn("flex items-center gap-2 font-mono text-[11px] font-bold tracking-widest", cfg.color)}>
-            <span className="animate-pulse">◉</span>
-            {cfg.icon}
-            {cfg.label}
-          </div>
-          <span className={cn("font-mono text-lg font-black tabular-nums", cfg.color)}>
-            {isIndeterminate ? "—" : `${subPct}%`}
-          </span>
-        </div>
-
-        {/* Progress bar */}
-        <div className="px-4 py-3 space-y-2">
-          <div className="relative w-full h-2.5 bg-muted/60 rounded-full overflow-hidden">
-            {/* Filled track */}
-            <motion.div
-              className={cn("absolute left-0 top-0 bottom-0 rounded-full", cfg.barColor, cfg.glowColor)}
-              initial={{ width: 0 }}
-              animate={{ width: isIndeterminate ? "100%" : `${subPct}%` }}
-              transition={{ duration: 0.4, ease: "easeOut" }}
-              style={isIndeterminate ? { opacity: 0.3 } : {}}
-            />
-
-            {/* Animated scan line */}
-            {(subPct < 100) && (
-              <motion.div
-                className={cn("absolute top-0 bottom-0 w-16 bg-gradient-to-r pointer-events-none", cfg.scanColor)}
-                animate={{ x: isIndeterminate ? ["0%", "600%"] : [`${Math.max(0, subPct - 8)}%`, `${subPct + 2}%`] }}
-                transition={
-                  isIndeterminate
-                    ? { duration: 1.4, repeat: Infinity, ease: "easeInOut" }
-                    : { duration: 0.6, repeat: Infinity, repeatType: "reverse", ease: "easeInOut" }
-                }
-              />
-            )}
-
-            {/* Completion flash */}
-            {subPct >= 100 && (
-              <motion.div
-                className="absolute inset-0 bg-white/20 rounded-full"
-                initial={{ opacity: 1 }}
-                animate={{ opacity: 0 }}
-                transition={{ duration: 0.6 }}
-              />
-            )}
-          </div>
-
-          {/* Tick marks */}
-          <div className="flex justify-between px-0.5">
-            {[0, 25, 50, 75, 100].map((tick) => (
-              <span
-                key={tick}
-                className={cn(
-                  "font-mono text-[9px] tabular-nums",
-                  subPct >= tick ? cfg.color + "/70" : "text-muted-foreground/30"
-                )}
-              >
-                {tick}
-              </span>
-            ))}
-          </div>
-
-          {/* Sublabel + block progress */}
-          <div className="flex items-center justify-between">
-            <span className="font-mono text-[10px] text-muted-foreground">{cfg.sublabel}</span>
-            <span className="font-mono text-[10px] text-muted-foreground/50 tabular-nums">
-              {isIndeterminate ? "calculating…" : `${subPct} / 100`}
-            </span>
-          </div>
-
-          {/* Block-style progress (terminal aesthetic) */}
-          <div className="font-mono text-[11px] flex items-center gap-1 overflow-hidden">
-            <span className={cfg.color + "/40"}>{"["}</span>
-            <span className={cfg.color}>
-              {isIndeterminate
-                ? "░".repeat(20)
-                : "█".repeat(Math.floor(subPct / 5)) + "░".repeat(20 - Math.floor(subPct / 5))}
-            </span>
-            <span className={cfg.color + "/40"}>]</span>
+    <div className="pt-4 border-t border-border/70 space-y-2.5">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <Icon className={cn("w-4 h-4 shrink-0", cfg.textClass)} />
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-foreground truncate">{cfg.label}</p>
+            <p className="text-xs text-muted-foreground truncate">{cfg.sublabel}</p>
           </div>
         </div>
-      </motion.div>
-    </AnimatePresence>
+        <span className={cn("font-mono text-base font-semibold tabular-nums shrink-0", cfg.textClass)}>
+          {isIndeterminate ? "—" : `${subPct}%`}
+        </span>
+      </div>
+
+      <div className="relative w-full h-2 bg-muted rounded-full overflow-hidden">
+        <div
+          className={cn("h-full rounded-full transition-all duration-300 ease-out", cfg.barClass)}
+          style={{ width: isIndeterminate ? "35%" : `${subPct}%` }}
+        />
+      </div>
+    </div>
   );
 }
 
@@ -197,9 +106,9 @@ export function JobPipeline({
 }) {
   if (currentStatus === "failed") {
     return (
-      <div className="w-full bg-destructive/10 border border-destructive/30 rounded p-4 text-destructive font-mono text-sm flex items-center gap-3">
-        <div className="w-2 h-2 rounded-full bg-destructive animate-pulse shrink-0" />
-        MISSION FAILED. SYSTEM HALTED.
+      <div className="flex items-center gap-2.5 py-2 text-sm text-red-300">
+        <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+        <span className="font-medium">Pipeline stopped on error — review recovery actions below.</span>
       </div>
     );
   }
@@ -209,10 +118,9 @@ export function JobPipeline({
   const isActive = ["downloading", "processing", "publishing"].includes(currentStatus);
 
   return (
-    <div className="w-full space-y-3">
-      {/* Step indicators */}
-      <div className="overflow-x-auto -mx-1 px-1">
-        <div className="flex items-center min-w-max gap-1.5 sm:gap-0 sm:justify-between sm:min-w-0 sm:w-full">
+    <div className="w-full space-y-4">
+      <div className="overflow-x-auto pb-1 -mx-1 px-1">
+        <div className="flex items-center min-w-max sm:min-w-0 sm:w-full gap-1 sm:gap-0">
           {PIPELINE_STEPS.map((step, index) => {
             const isCompleted = index < currentIndex || isDone;
             const isStepActive = index === currentIndex && !isDone;
@@ -220,31 +128,27 @@ export function JobPipeline({
 
             return (
               <div key={step.id} className="flex items-center sm:flex-1 sm:last:flex-none">
-                <div className="flex flex-col items-center gap-1">
+                <div className="flex flex-col items-center gap-1.5 min-w-[48px] sm:min-w-0">
                   <div
                     className={cn(
-                      "w-8 h-8 rounded-md flex items-center justify-center transition-all duration-300 shrink-0",
+                      "w-7 h-7 rounded-full flex items-center justify-center text-xs font-mono font-semibold transition-colors duration-200 shrink-0",
                       isCompleted
-                        ? "bg-primary text-primary-foreground shadow-[0_0_10px_hsl(var(--primary)/0.5)]"
+                        ? "bg-primary text-primary-foreground"
                         : isStepActive
-                        ? "bg-primary/20 text-primary border border-primary/60 shadow-[0_0_6px_hsl(var(--primary)/0.3)]"
+                        ? "bg-primary/15 text-primary border border-primary"
                         : "bg-muted text-muted-foreground border border-border"
                     )}
                   >
-                    {isCompleted ? (
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                    ) : (
-                      <span className="font-mono text-[9px] font-bold">{step.short}</span>
-                    )}
+                    {isCompleted ? <Check className="w-3.5 h-3.5" /> : step.short}
                   </div>
                   <span
                     className={cn(
-                      "text-[10px] font-mono hidden sm:block text-center leading-none",
+                      "text-[11px] font-medium text-center whitespace-nowrap",
                       isCompleted
-                        ? "text-primary"
+                        ? "text-foreground"
                         : isStepActive
-                        ? "text-primary/80"
-                        : "text-muted-foreground/50"
+                        ? "text-primary"
+                        : "text-muted-foreground/70"
                     )}
                   >
                     {step.label}
@@ -254,20 +158,10 @@ export function JobPipeline({
                 {!isLast && (
                   <div
                     className={cn(
-                      "hidden sm:block h-px flex-1 mx-1.5 transition-colors duration-300",
+                      "h-px w-4 sm:w-auto sm:flex-1 mx-1 sm:mx-2 -mt-5 transition-colors duration-200",
                       isCompleted ? "bg-primary/60" : "bg-border"
                     )}
                   />
-                )}
-                {!isLast && (
-                  <span
-                    className={cn(
-                      "sm:hidden mx-1 text-[10px] font-mono",
-                      isCompleted ? "text-primary/60" : "text-border"
-                    )}
-                  >
-                    ›
-                  </span>
                 )}
               </div>
             );
@@ -275,36 +169,26 @@ export function JobPipeline({
         </div>
       </div>
 
-      {/* Overall thin progress bar */}
-      <div className="relative w-full h-1.5 bg-muted rounded-full overflow-hidden">
+      {/* Overall timeline bar */}
+      <div className="relative w-full h-1 bg-muted rounded-full overflow-hidden">
         <div
-          className="absolute left-0 top-0 bottom-0 bg-primary transition-all duration-500 ease-out rounded-full"
+          className="h-full bg-primary transition-all duration-300 ease-out rounded-full"
           style={{
-            width: `${Math.max(0, (isDone ? 1 : currentIndex / (PIPELINE_STEPS.length - 1)) * 100)}%`,
+            width: `${Math.max(
+              4,
+              isDone
+                ? 100
+                : Math.min(
+                    100,
+                    ((Math.max(0, currentIndex) + (progress > 0 ? progress / 100 : 0.1)) /
+                      (PIPELINE_STEPS.length - 1)) *
+                      100
+                  )
+            )}%`,
           }}
         />
-        {progress > 0 && progress < 100 && (
-          <div
-            className="absolute left-0 top-0 bottom-0 bg-primary/40 transition-all duration-300 ease-out rounded-full"
-            style={{
-              width: `${
-                (currentIndex / (PIPELINE_STEPS.length - 1)) * 100 +
-                (progress / 100) * (100 / (PIPELINE_STEPS.length - 1))
-              }%`,
-            }}
-          />
-        )}
       </div>
 
-      {/* Mobile active step label */}
-      {currentIndex >= 0 && !isDone && (
-        <p className="sm:hidden text-xs font-mono text-primary">
-          ▶ {PIPELINE_STEPS[currentIndex]?.label}
-        </p>
-      )}
-      {isDone && <p className="sm:hidden text-xs font-mono text-primary">✓ Complete</p>}
-
-      {/* Per-stage detailed progress panel */}
       {isActive && <StageProgressPanel status={currentStatus} progress={progress} />}
     </div>
   );

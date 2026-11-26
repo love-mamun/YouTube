@@ -214,10 +214,7 @@ export default function Discover() {
     <Layout>
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }} className="space-y-8">
         <div>
-          <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground mb-1 tracking-widest uppercase">
-            <div className="w-1.5 h-1.5 rounded-full bg-primary" />YouTube Data API v3
-          </div>
-          <h1 className="text-2xl sm:text-3xl font-display font-bold text-foreground">Discover</h1>
+          <h1 className="text-2xl sm:text-3xl font-display font-semibold tracking-tight text-foreground">Discover</h1>
           <p className="text-muted-foreground text-sm mt-1">Explore trending content and research competitors — import any video to N3XUS instantly.</p>
         </div>
 
@@ -245,28 +242,28 @@ export default function Discover() {
             </div>
           </div>
 
-          <div className="flex gap-2">
+          <div className="flex flex-col sm:flex-row gap-2">
             <Input
               placeholder="Search YouTube… e.g. 'AI tutorial 2024', 'gaming highlights'"
               value={pendingQuery}
               onChange={(e) => setPendingQuery(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-              className="flex-1 font-mono text-sm bg-muted/40 border-border/70"
+              className="flex-1 font-mono text-sm bg-muted/50 border-border min-h-[44px] h-11"
             />
-            <div className="flex gap-1">
+            <div className="flex gap-1.5">
               {(["relevance", "viewCount", "date"] as const).map((o) => (
                 <button key={o} onClick={() => setSortOrder(o)}
-                  className={`text-xs font-mono px-2 py-1 rounded border transition-colors ${
-                    sortOrder === o ? "bg-primary/20 text-primary border-primary/30" : "text-muted-foreground border-border/50 hover:border-border"
+                  className={`text-xs font-medium px-3 min-h-[44px] rounded-lg border transition-colors ${
+                    sortOrder === o ? "bg-primary/15 text-primary border-primary/40" : "text-muted-foreground border-border hover:text-foreground"
                   }`}>
                   {o === "relevance" ? "Relevant" : o === "viewCount" ? "Top" : "Latest"}
                 </button>
               ))}
+              <Button onClick={() => handleSearch()} disabled={loadingSearch || !pendingQuery.trim()} className="gap-2 font-medium text-xs min-h-[44px] h-11 px-4 bg-primary text-primary-foreground hover:bg-primary/90">
+                {loadingSearch ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                Search
+              </Button>
             </div>
-            <Button onClick={() => handleSearch()} disabled={loadingSearch || !pendingQuery.trim()} className="gap-2 font-mono text-xs">
-              {loadingSearch ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
-              Search
-            </Button>
           </div>
 
           <AnimatePresence>

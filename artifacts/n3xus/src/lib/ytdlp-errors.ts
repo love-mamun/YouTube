@@ -19,6 +19,138 @@ export interface ParsedJobDiagnostic {
   showSettingsLink: boolean;
 }
 
+export interface ProxyPreviewEntry {
+  raw: string;
+  normalized: string | null;
+  valid: boolean;
+  error: string | null;
+}
+
+export interface ProxyPreviewSummary {
+  total: number;
+  validCount: number;
+  invalidCount: number;
+  entries: ProxyPreviewEntry[];
+  firstError: string | null;
+}
+
+function isDisallowedClientProxyHost(hostname: string): boolean {
+  let host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (!host) return true;
+  if (host.startsWith("::ffff:")) {
+    const tail = host.slice("::ffff:".length);
+    const hexMatch = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      host = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    } else {
+      host = tail;
+    }
+  }
+  if (
+    host === "localhost" ||
+    host === "::1" ||
+    host === "::" ||
+    host === "0.0.0.0" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local")
+  ) {
+    return true;
+  }
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [, a, b] = ipv4.map(Number);
+    if (a === 127 || a === 10 || a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+  }
+  if (host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) {
+    return true;
+  }
+  return false;
+}
+
+const ALLOWED_PROXY_SCHEMES = new Set(["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"]);
+
+export function previewProxyListClient(raw: string): ProxyPreviewSummary | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+
+  const rawTokens: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const cleanedLine = line.trim();
+    if (!cleanedLine || cleanedLine.startsWith("#")) continue;
+    for (const part of cleanedLine.split(/[,;\s]+/)) {
+      const token = part.trim();
+      if (token) rawTokens.push(token);
+    }
+  }
+
+  if (rawTokens.length === 0) return null;
+
+  const seen = new Set<string>();
+  const entries: ProxyPreviewEntry[] = [];
+  let validCount = 0;
+  let invalidCount = 0;
+  let firstError: string | null = null;
+
+  for (const token of rawTokens) {
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(token) ? token : `http://${token}`;
+    let parsed: URL;
+    try {
+      parsed = new URL(withScheme);
+    } catch {
+      const err = `Invalid proxy "${token}". Expected ip:port (e.g. 103.152.112.162:8080).`;
+      entries.push({ raw: token, normalized: null, valid: false, error: err });
+      invalidCount++;
+      if (!firstError) firstError = err;
+      continue;
+    }
+
+    if (!ALLOWED_PROXY_SCHEMES.has(parsed.protocol)) {
+      const err = `Unsupported scheme "${parsed.protocol}". Use ip:port, http://, https://, socks5://, or socks4://.`;
+      entries.push({ raw: token, normalized: null, valid: false, error: err });
+      invalidCount++;
+      if (!firstError) firstError = err;
+      continue;
+    }
+
+    if (!parsed.hostname || isDisallowedClientProxyHost(parsed.hostname)) {
+      const err = `Blocked local/private proxy host "${parsed.hostname || token}".`;
+      entries.push({ raw: token, normalized: null, valid: false, error: err });
+      invalidCount++;
+      if (!firstError) firstError = err;
+      continue;
+    }
+
+    const portNum = Number(parsed.port);
+    if (!parsed.port || Number.isNaN(portNum) || portNum < 1 || portNum > 65535) {
+      const err = `Missing or invalid port on "${token}". Expected ip:port (port 1-65535).`;
+      entries.push({ raw: token, normalized: null, valid: false, error: err });
+      invalidCount++;
+      if (!firstError) firstError = err;
+      continue;
+    }
+
+    const normalized = parsed.toString().replace(/\/+$/, "");
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      entries.push({ raw: token, normalized, valid: true, error: null });
+      validCount++;
+    }
+  }
+
+  return {
+    total: entries.length,
+    validCount,
+    invalidCount,
+    entries,
+    firstError,
+  };
+}
+
 export function previewNetscapeCookiesClient(raw: string): CookieValidationSummary | null {
   if (typeof raw !== "string" || !raw.trim()) return null;
 

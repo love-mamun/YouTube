@@ -4,7 +4,11 @@ import {
   buildDownloadFormatPlan,
   buildExtractorArgsForStrategy,
 } from "./ytdlp-downloader";
-import { classifyYtDlpError } from "./ytdlp-config";
+import {
+  classifyYtDlpError,
+  parseAndValidateProxyList,
+  validateAndNormalizeProxyUrl,
+} from "./ytdlp-config";
 
 test("classifyYtDlpError distinguishes 4K_UNAVAILABLE from BOT_CHECK and COOKIES_EXPIRED", () => {
   const unavailable = classifyYtDlpError(
@@ -128,4 +132,43 @@ test("buildExtractorArgsForStrategy omits player_client=default and includes for
     }),
     ["--extractor-args", "youtube:player_client=android_vr;formats=missing_pot"],
   );
+});
+
+test("parseAndValidateProxyList supports bare ip:port,ip:port template, comments, deduplication, and masks credentials", () => {
+  const raw = [
+    "# Free proxy batch",
+    "103.152.112.162:8080,",
+    "45.140.143.77:3128",
+    "103.152.112.162:8080",
+    "socks5://user1:secret@64.137.96.74:6641,",
+  ].join("\n");
+
+  const res = parseAndValidateProxyList(raw);
+  assert.equal(res.ok, true);
+  if (!res.ok) return;
+
+  assert.deepEqual(res.proxies, [
+    "http://103.152.112.162:8080",
+    "http://45.140.143.77:3128",
+    "socks5://user1:secret@64.137.96.74:6641",
+  ]);
+  assert.deepEqual(res.maskedList, [
+    "http://103.152.112.162:8080",
+    "http://45.140.143.77:3128",
+    "socks5://***@64.137.96.74:6641",
+  ]);
+  assert.equal(res.summary, "http://103.152.112.162:8080 (+2 more)");
+});
+
+test("validateAndNormalizeProxyUrl and parseAndValidateProxyList reject private/loopback IPs and missing ports", () => {
+  assert.equal(validateAndNormalizeProxyUrl("127.0.0.1:8080").ok, false);
+  assert.equal(validateAndNormalizeProxyUrl("192.168.1.50:3128").ok, false);
+  assert.equal(validateAndNormalizeProxyUrl("[::ffff:127.0.0.1]:8080").ok, false);
+  assert.equal(validateAndNormalizeProxyUrl("103.152.112.162").ok, false);
+
+  const mixed = parseAndValidateProxyList("103.152.112.162:8080,\n127.0.0.1:8080");
+  assert.equal(mixed.ok, false);
+  if (!mixed.ok) {
+    assert.match(mixed.error, /Proxy #2/i);
+  }
 });

@@ -9,7 +9,7 @@ import {
   YT_COOKIES_PATH,
   YT_PROXY_DB_KEY,
   validateNetscapeCookies,
-  validateAndNormalizeProxyUrl,
+  parseAndValidateProxyList,
   getMaskedProxyStatus,
 } from "../lib/ytdlp-config";
 import { runYtDlpDiagnostics } from "../lib/ytdlp-downloader";
@@ -179,24 +179,31 @@ router.get("/settings/yt-proxy", requireSettingsAuth, async (_req, res): Promise
   res.json(status);
 });
 
-// POST /api/settings/yt-proxy — validate SSRF-safely & save proxy URL
+// POST /api/settings/yt-proxy — validate SSRF-safely & save single or multi-proxy list
 router.post("/settings/yt-proxy", requireSettingsAuth, async (req, res): Promise<void> => {
   const body = req.body as { proxyUrl?: string };
-  const check = validateAndNormalizeProxyUrl(body?.proxyUrl ?? "");
+  const check = parseAndValidateProxyList(body?.proxyUrl ?? "");
   if (!check.ok) {
     res.status(400).json({ error: check.error });
     return;
   }
 
+  const storedValue = check.proxies.join("\n");
   await db
     .insert(appConfigTable)
-    .values({ key: YT_PROXY_DB_KEY, value: check.normalized })
+    .values({ key: YT_PROXY_DB_KEY, value: storedValue })
     .onConflictDoUpdate({
       target: appConfigTable.key,
-      set: { value: check.normalized, updatedAt: new Date() },
+      set: { value: storedValue, updatedAt: new Date() },
     });
 
-  res.json({ ok: true, set: true, maskedHost: check.masked });
+  res.json({
+    ok: true,
+    set: true,
+    count: check.proxies.length,
+    maskedHost: check.summary,
+    maskedProxies: check.maskedList,
+  });
 });
 
 // DELETE /api/settings/yt-proxy — remove saved proxy
@@ -217,14 +224,14 @@ router.post("/settings/yt-diagnostics/test", requireSettingsAuth, async (req, re
     runLiveProbe?: boolean;
   };
 
-  let proxyOverride: string | null | undefined = undefined;
+  let proxyListOverride: string[] | undefined = undefined;
   if (typeof body.proxyUrl === "string" && body.proxyUrl.trim()) {
-    const check = validateAndNormalizeProxyUrl(body.proxyUrl);
+    const check = parseAndValidateProxyList(body.proxyUrl);
     if (!check.ok) {
       res.status(400).json({ error: check.error });
       return;
     }
-    proxyOverride = check.normalized;
+    proxyListOverride = check.proxies;
   }
 
   let safeTestUrl: string | undefined = undefined;
@@ -248,7 +255,7 @@ router.post("/settings/yt-diagnostics/test", requireSettingsAuth, async (req, re
   const cookieValidation = cookieRow?.value ? validateNetscapeCookies(cookieRow.value) : null;
   const report = await runYtDlpDiagnostics({
     testUrl: safeTestUrl,
-    proxyOverride,
+    proxyListOverride,
     runLiveProbe: body.runLiveProbe !== false,
   });
 

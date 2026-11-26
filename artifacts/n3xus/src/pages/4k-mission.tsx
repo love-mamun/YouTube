@@ -6,30 +6,55 @@ import { Layout } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef } from "react";
 import {
-  Play, Youtube, Facebook, AlertCircle, Loader2,
-  MonitorPlay, ChevronDown, CheckCircle2,
+  Youtube,
+  Facebook,
+  AlertCircle,
+  Loader2,
+  MonitorPlay,
+  CheckCircle2,
+  Video,
 } from "lucide-react";
 
 const QUALITY_OPTIONS = [
-  { value: "360p",  label: "360p",          desc: "SD — smallest file size",       badge: "SD",  color: "bg-muted-foreground" },
-  { value: "480p",  label: "480p",          desc: "SD+ — good for mobile",         badge: "SD+", color: "bg-muted-foreground" },
-  { value: "720p",  label: "720p HD",       desc: "HD — standard high definition", badge: "HD",  color: "bg-yellow-500"       },
-  { value: "1080p", label: "1080p Full HD", desc: "Full HD — YouTube default",     badge: "FHD", color: "bg-green-500"        },
-  { value: "1440p", label: "1440p 2K",      desc: "2K — ultra sharp quality",      badge: "2K",  color: "bg-cyan-400"         },
-  { value: "4k",    label: "2160p 4K",      desc: "4K UHD — maximum quality",      badge: "4K",  color: "bg-primary"          },
-];
-
-const BADGE_COLORS: Record<string, string> = {
-  "360p":  "border-border text-muted-foreground",
-  "480p":  "border-border text-muted-foreground",
-  "720p":  "border-yellow-500/40 text-yellow-400",
-  "1080p": "border-green-500/40 text-green-400",
-  "1440p": "border-cyan-400/40 text-cyan-400",
-  "4k":    "border-primary/40 text-primary",
-};
+  {
+    value: "360p",
+    label: "360p SD",
+    desc: "Smallest file size",
+    bitrate: "1 Mbps",
+  },
+  {
+    value: "480p",
+    label: "480p SD+",
+    desc: "Compact mobile format",
+    bitrate: "2 Mbps",
+  },
+  {
+    value: "720p",
+    label: "720p HD",
+    desc: "Standard high definition",
+    bitrate: "5 Mbps",
+  },
+  {
+    value: "1080p",
+    label: "1080p Full HD",
+    desc: "YouTube standard crisp HD",
+    bitrate: "8 Mbps",
+  },
+  {
+    value: "1440p",
+    label: "1440p 2K",
+    desc: "High-density 2K master",
+    bitrate: "16 Mbps",
+  },
+  {
+    value: "4k",
+    label: "2160p 4K UHD",
+    desc: "Maximum clarity master",
+    bitrate: "35 Mbps",
+  },
+] as const;
 
 function detectPlatform(url: string): "youtube" | "facebook" | "other" | null {
   if (!url.trim()) return null;
@@ -43,46 +68,38 @@ function extractYouTubeId(url: string): string | null {
   return m?.[1] ?? null;
 }
 
-interface UrlPreview { thumbnail: string; title: string }
+interface UrlPreview {
+  thumbnail: string;
+  title: string;
+}
 
 export default function FourKMission() {
   const [, navigate] = useLocation();
   const [url, setUrl] = useState("");
   const [quality, setQuality] = useState("1080p");
-  const [dropdownOpen, setDropdownOpen] = useState(false);
   const [preview, setPreview] = useState<UrlPreview | null>(null);
+  const [previewFailed, setPreviewFailed] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const queryClient = useQueryClient();
   const createJob = useCreateJob();
-
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const dropdownRef = useRef<HTMLDivElement>(null);
-
-  // Close dropdown on outside click
-  useEffect(() => {
-    if (!dropdownOpen) return;
-    function handler(e: MouseEvent) {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setDropdownOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [dropdownOpen]);
 
   const platform = detectPlatform(url);
 
   const fetchPreview = useCallback(async (val: string) => {
+    setPreviewFailed(false);
     if (!val.trim() || !/youtube\.com|youtu\.be/i.test(val)) {
       setPreview(null);
       return;
     }
     setPreviewLoading(true);
     try {
-      const res = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(val)}&format=json`);
+      const res = await fetch(
+        `https://www.youtube.com/oembed?url=${encodeURIComponent(val)}&format=json`
+      );
       if (res.ok) {
         const data = (await res.json()) as { title?: string };
         const vid = extractYouTubeId(val);
@@ -107,7 +124,8 @@ export default function FourKMission() {
     previewTimer.current = setTimeout(() => fetchPreview(val), 600);
   };
 
-  const selectedQuality = QUALITY_OPTIONS.find(q => q.value === quality) ?? QUALITY_OPTIONS[3];
+  const selectedQuality =
+    QUALITY_OPTIONS.find((q) => q.value === quality) ?? QUALITY_OPTIONS[3];
 
   const canSubmit = !launching && url.trim().length > 0;
 
@@ -122,7 +140,7 @@ export default function FourKMission() {
           youtubeUrl: url.trim(),
           publishMode: "manual",
           platforms: "youtube",
-          quality,
+          quality: quality as "360p" | "480p" | "720p" | "1080p" | "1440p" | "4k",
           missionType: "4k",
         },
       });
@@ -130,230 +148,253 @@ export default function FourKMission() {
       navigate(`/jobs/${job.id}`);
     } catch (err) {
       setLaunching(false);
-      setError((err as { message?: string })?.message ?? "Failed to launch mission");
+      setError(
+        (err as { message?: string })?.message ?? "Failed to launch mission"
+      );
     }
   };
 
   return (
     <Layout>
       <motion.div
-        initial={{ opacity: 0, y: 12 }}
+        initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.3 }}
-        className="max-w-2xl space-y-5 sm:space-y-6"
+        transition={{ duration: 0.25 }}
+        className="space-y-6"
       >
-        {/* Header */}
         <div>
-          <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground mb-1 tracking-widest uppercase">
-            <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-            Quality Mission
-          </div>
-          <h1 className="text-2xl sm:text-3xl font-display font-bold text-foreground flex items-center gap-3">
-            4K Mission
-            <Badge className="text-xs font-mono bg-primary/10 text-primary border-primary/30 px-2 py-0.5">
-              UHD
-            </Badge>
+          <h1 className="text-2xl sm:text-3xl font-display font-semibold tracking-tight text-foreground">
+            4K Studio
           </h1>
-          <p className="text-muted-foreground text-sm mt-1">
-            Paste a URL, pick quality — every resolution gets the full FFmpeg treatment: metadata stripped, speed-adjusted, audio pitch-shifted, watermarked. Copyright-safe. Original title &amp; description preserved for publishing.
+          <p className="text-sm text-muted-foreground mt-1 max-w-2xl">
+            Every selected resolution runs through the FFmpeg pipeline: metadata strip, subtle speed and pitch adjustment, and watermark overlay while preserving the original title and description.
           </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4 sm:space-y-5">
-
-          {/* URL Input */}
-          <Card className="p-4 sm:p-6 border-border bg-card/80 backdrop-blur-sm space-y-4">
-            <h2 className="text-xs font-mono uppercase tracking-widest text-muted-foreground">Source Video URL</h2>
-
-            <div className="space-y-3">
-              <div className="relative">
-                <Input
-                  type="url"
-                  placeholder="Paste YouTube or Facebook URL..."
-                  value={url}
-                  onChange={(e) => handleUrlChange(e.target.value)}
-                  className="font-mono text-sm bg-muted border-border focus:border-primary pr-28 h-11"
-                  autoComplete="off"
-                  autoFocus
-                />
-                <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none">
-                  {platform === "youtube" && (
-                    <Badge variant="secondary" className="text-[10px] gap-1 bg-red-500/10 text-red-400 border-red-500/20">
-                      <Youtube className="w-3 h-3" /> YouTube
-                    </Badge>
-                  )}
-                  {platform === "facebook" && (
-                    <Badge variant="secondary" className="text-[10px] gap-1 bg-blue-500/10 text-blue-400 border-blue-500/20">
-                      <Facebook className="w-3 h-3" /> Facebook
-                    </Badge>
-                  )}
-                  {platform === "other" && (
-                    <Badge variant="secondary" className="text-[10px] gap-1">
-                      <AlertCircle className="w-3 h-3" /> Other
-                    </Badge>
-                  )}
-                </div>
+        <form
+          onSubmit={handleSubmit}
+          className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-6 items-start"
+        >
+          {/* Left Studio Inputs */}
+          <div className="space-y-5 min-w-0">
+            <Card className="p-4 sm:p-6 border-border bg-card space-y-4">
+              <div>
+                <h2 className="text-base font-display font-semibold text-foreground">
+                  Source Video URL
+                </h2>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Paste a YouTube or Facebook link to prepare high-bitrate FFmpeg processing.
+                </p>
               </div>
 
-              {/* Preview */}
-              {previewLoading && (
-                <div className="flex items-center gap-2 text-xs text-muted-foreground font-mono">
-                  <Loader2 className="w-3 h-3 animate-spin" /> Fetching preview…
-                </div>
-              )}
-              <AnimatePresence>
-                {preview && !previewLoading && (
-                  <motion.div
-                    initial={{ opacity: 0, y: 4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0 }}
-                    className="flex gap-3 items-center p-3 rounded-md bg-muted/50 border border-border"
-                  >
-                    <img
-                      src={preview.thumbnail}
-                      alt="thumbnail"
-                      className="w-20 h-12 object-cover rounded shrink-0 bg-muted"
-                      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-                    />
-                    <div className="min-w-0 flex-1">
-                      <p className="text-xs font-medium text-foreground line-clamp-2">{preview.title}</p>
-                      <p className="text-[10px] font-mono text-muted-foreground mt-0.5">Preview loaded</p>
-                    </div>
-                    <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
-          </Card>
-
-          {/* Quality Selector */}
-          <Card className="p-4 sm:p-6 border-border bg-card/80 backdrop-blur-sm space-y-3 sm:space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xs font-mono uppercase tracking-widest text-muted-foreground">Download Quality</h2>
-              <Badge variant="outline" className={`text-[10px] font-mono px-2 ${BADGE_COLORS[quality]}`}>
-                {selectedQuality.badge}
-              </Badge>
-            </div>
-
-            {/* Dropdown */}
-            <div className="relative" ref={dropdownRef}>
-              <button
-                type="button"
-                onClick={() => setDropdownOpen((o) => !o)}
-                className="w-full flex items-center justify-between gap-3 px-4 py-3 rounded-md border border-border bg-muted hover:border-primary/50 active:scale-[0.99] transition-all text-left"
-              >
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${selectedQuality.color}`} />
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-foreground">{selectedQuality.label}</p>
-                    <p className="text-xs text-muted-foreground">{selectedQuality.desc}</p>
+              <div className="space-y-3">
+                <div className="relative">
+                  <Input
+                    type="url"
+                    placeholder="Paste YouTube or Facebook URL..."
+                    value={url}
+                    onChange={(e) => handleUrlChange(e.target.value)}
+                    className="font-mono text-sm bg-muted/60 border-border focus:border-primary pr-28 min-h-[44px] h-11"
+                    autoComplete="off"
+                    autoFocus
+                  />
+                  <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none flex items-center gap-1.5 text-xs font-mono text-muted-foreground">
+                    {platform === "youtube" && (
+                      <>
+                        <Youtube className="w-3.5 h-3.5 text-red-500" />
+                        <span>YouTube</span>
+                      </>
+                    )}
+                    {platform === "facebook" && (
+                      <>
+                        <Facebook className="w-3.5 h-3.5 text-blue-500" />
+                        <span>Facebook</span>
+                      </>
+                    )}
+                    {platform === "other" && (
+                      <>
+                        <AlertCircle className="w-3.5 h-3.5" />
+                        <span>URL</span>
+                      </>
+                    )}
                   </div>
                 </div>
-                <ChevronDown className={`w-4 h-4 text-muted-foreground shrink-0 transition-transform duration-200 ${dropdownOpen ? "rotate-180" : ""}`} />
-              </button>
 
-              <AnimatePresence>
-                {dropdownOpen && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -6, scaleY: 0.95 }}
-                    animate={{ opacity: 1, y: 0, scaleY: 1 }}
-                    exit={{ opacity: 0, y: -4, scaleY: 0.97 }}
-                    transition={{ duration: 0.15 }}
-                    style={{ originY: 0 }}
-                    className="absolute z-30 top-full left-0 right-0 mt-1.5 rounded-md border border-border bg-card shadow-2xl overflow-hidden"
-                  >
-                    {QUALITY_OPTIONS.map((opt) => {
-                      const isSelected = quality === opt.value;
-                      return (
-                        <button
-                          key={opt.value}
-                          type="button"
-                          onClick={() => { setQuality(opt.value); setDropdownOpen(false); }}
-                          className={`w-full flex items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-muted ${
-                            isSelected ? "bg-primary/5" : ""
-                          } ${isSelected ? "border-l-2 border-l-primary" : "border-l-2 border-l-transparent"}`}
+                {previewLoading && (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground font-mono">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />{" "}
+                    Fetching preview…
+                  </div>
+                )}
+
+                <AnimatePresence>
+                  {preview && !previewLoading && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0 }}
+                      className="flex gap-3 items-center p-3 rounded-lg bg-muted/40"
+                    >
+                      {preview.thumbnail && !previewFailed ? (
+                        <img
+                          src={preview.thumbnail}
+                          alt={preview.title || "Preview"}
+                          className="w-24 aspect-video object-cover rounded shrink-0 bg-muted"
+                          onError={() => setPreviewFailed(true)}
+                        />
+                      ) : (
+                        <div className="w-24 aspect-video rounded shrink-0 bg-muted flex items-center justify-center text-muted-foreground">
+                          <Video className="w-4 h-4" />
+                        </div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium text-foreground line-clamp-2 leading-snug">
+                          {preview.title}
+                        </p>
+                        <p className="text-xs font-mono text-muted-foreground mt-0.5">
+                          Ready for {selectedQuality.label}
+                        </p>
+                      </div>
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            </Card>
+
+            {/* Target Resolution Grid */}
+            <Card className="p-4 sm:p-6 border-border bg-card space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-base font-display font-semibold text-foreground">
+                    Target Resolution
+                  </h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Select output frame scale and target video bitrate.
+                  </p>
+                </div>
+                <span className="text-xs font-mono tabular-nums text-primary">
+                  {selectedQuality.bitrate}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {QUALITY_OPTIONS.map((opt) => {
+                  const isSelected = quality === opt.value;
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => setQuality(opt.value)}
+                      className={`text-left p-3.5 rounded-lg border transition-colors min-h-[60px] ${
+                        isSelected
+                          ? "border-primary bg-primary/10"
+                          : "border-border bg-muted/25 hover:border-muted-foreground/40 hover:bg-muted/40"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span
+                          className={`text-sm font-medium ${
+                            isSelected ? "text-primary" : "text-foreground"
+                          }`}
                         >
-                          <div className="flex items-center gap-3 min-w-0">
-                            <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${opt.color}`} />
-                            <div className="min-w-0">
-                              <p className={`text-sm font-medium ${isSelected ? "text-primary" : "text-foreground"}`}>
-                                {opt.label}
-                              </p>
-                              <p className="text-xs text-muted-foreground">{opt.desc}</p>
-                            </div>
-                          </div>
-                          <Badge variant="outline" className={`text-[10px] font-mono shrink-0 ${BADGE_COLORS[opt.value]}`}>
-                            {opt.badge}
-                          </Badge>
-                        </button>
-                      );
-                    })}
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
+                          {opt.label}
+                        </span>
+                        <span className="text-xs font-mono tabular-nums text-muted-foreground">
+                          {opt.bitrate}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        {opt.desc}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            </Card>
+          </div>
 
-            {/* Pipeline info */}
-            <div className="rounded-md bg-muted/40 border border-border p-3 space-y-1.5">
-              <div className="flex items-center justify-between">
-                <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-widest">FFmpeg Pipeline</p>
-                <span className="text-[10px] font-mono text-primary/70">Applied to ALL resolutions</span>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1">
-                {[
-                  "Strip all metadata (fingerprint-safe)",
-                  "Video 2% speed adjust",
-                  `Scale → ${selectedQuality.label}`,
-                  "Crop 2px edges",
-                  "Watermark center-bottom",
-                  "Audio pitch shift (copyright-safe)",
-                  `Bitrate: ${quality === "4k" ? "20 Mbps" : quality === "1440p" ? "12 Mbps" : quality === "1080p" ? "8 Mbps" : quality === "720p" ? "5 Mbps" : quality === "480p" ? "2 Mbps" : "1 Mbps"}`,
-                  "Preset: slow / CRF 18",
-                ].map((step) => (
-                  <div key={step} className="flex items-center gap-1.5 text-[11px] text-muted-foreground font-mono">
-                    <div className="w-1 h-1 rounded-full bg-primary/60 shrink-0" />
-                    {step}
-                  </div>
-                ))}
-              </div>
-              <p className="text-[10px] font-mono text-muted-foreground/50 pt-0.5">
-                Original title &amp; description preserved · AI generates tags &amp; hashtags
+          {/* Right Pipeline Spec & Launch Column */}
+          <Card className="p-4 sm:p-5 border-border bg-card space-y-4 lg:sticky lg:top-8">
+            <div>
+              <h2 className="text-base font-display font-semibold text-foreground">
+                FFmpeg Pipeline Spec
+              </h2>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Applied automatically across all selected resolutions.
               </p>
             </div>
-          </Card>
 
-          {/* Error */}
-          {error && (
-            <div className="flex items-center gap-2 text-xs text-destructive font-mono bg-destructive/10 border border-destructive/20 rounded-md p-3">
-              <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-              {error}
+            <div className="divide-y divide-border text-sm">
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Resolution</span>
+                <span className="font-mono font-medium text-foreground">
+                  {selectedQuality.label}
+                </span>
+              </div>
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Target Bitrate</span>
+                <span className="font-mono tabular-nums font-medium text-foreground">
+                  {selectedQuality.bitrate}
+                </span>
+              </div>
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Video Transform</span>
+                <span className="font-mono text-xs text-foreground">
+                  2% speed · 2px crop
+                </span>
+              </div>
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Audio Transform</span>
+                <span className="font-mono text-xs text-foreground">
+                  Pitch shift · normalized
+                </span>
+              </div>
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Metadata</span>
+                <span className="font-mono text-xs text-foreground">
+                  Stripped · clean ID
+                </span>
+              </div>
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Watermark</span>
+                <span className="font-mono text-xs text-foreground">
+                  Dual-corner logo
+                </span>
+              </div>
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Review Mode</span>
+                <span className="font-medium text-foreground">
+                  Manual Approval
+                </span>
+              </div>
             </div>
-          )}
 
-          {/* Launch */}
-          <Button
-            type="submit"
-            disabled={!canSubmit}
-            className="w-full gap-2 bg-primary text-primary-foreground hover:bg-primary/80 font-mono font-semibold h-12 text-base"
-          >
-            {launching ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                Launching…
-              </>
-            ) : (
-              <>
-                <MonitorPlay className="w-4 h-4" />
-                Launch 4K Mission
-              </>
+            {error && (
+              <div className="flex items-start gap-2 text-xs text-red-300 bg-red-500/10 border border-red-500/25 rounded-lg p-3">
+                <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <span>{error}</span>
+              </div>
             )}
-          </Button>
 
-          <p className="text-center text-xs text-muted-foreground font-mono">
-            Quality: <span className="text-primary">{selectedQuality.label}</span>
-            {" · "}Platform: YouTube
-            {" · "}Mode: Manual Approval
-          </p>
+            <Button
+              type="submit"
+              disabled={!canSubmit}
+              className="w-full gap-2 bg-primary text-primary-foreground hover:bg-primary/90 font-medium min-h-[48px] h-12 text-sm"
+            >
+              {launching ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Launching…
+                </>
+              ) : (
+                <>
+                  <MonitorPlay className="w-4 h-4" />
+                  Launch 4K Mission
+                </>
+              )}
+            </Button>
+          </Card>
         </form>
       </motion.div>
     </Layout>

@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseJobErrorDiagnostic, previewNetscapeCookiesClient } from "./ytdlp-errors";
+import {
+  parseJobErrorDiagnostic,
+  previewNetscapeCookiesClient,
+  previewProxyListClient,
+} from "./ytdlp-errors";
 
 test("parseJobErrorDiagnostic handles explicit bracketed codes including multiline text", () => {
   const diag = parseJobErrorDiagnostic(
@@ -45,4 +49,20 @@ test("previewNetscapeCookiesClient returns null on empty or non-string input and
   assert.equal(result.status, "valid");
   assert.equal(result.ytCookieCount, 3);
   assert.ok(result.foundAuthCookies.includes("SID"));
+});
+
+test("previewProxyListClient parses comma/newline ip:port template and flags invalid/private hosts", () => {
+  assert.equal(previewProxyListClient(""), null);
+
+  const okRes = previewProxyListClient("103.152.112.162:8080,\n45.140.143.77:3128,\n103.152.112.162:8080");
+  assert.ok(okRes);
+  assert.equal(okRes.validCount, 2);
+  assert.equal(okRes.invalidCount, 0);
+  assert.equal(okRes.entries[0]?.normalized, "http://103.152.112.162:8080");
+
+  const badRes = previewProxyListClient("103.152.112.162:8080,\n127.0.0.1:8080,\n99.99.99.99");
+  assert.ok(badRes);
+  assert.equal(badRes.validCount, 1);
+  assert.equal(badRes.invalidCount, 2);
+  assert.ok(badRes.firstError);
 });

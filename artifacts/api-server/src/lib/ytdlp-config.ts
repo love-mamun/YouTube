@@ -299,13 +299,26 @@ export async function acquireJobCookieCopy(
 // ── Proxy Validation & Storage ───────────────────────────────────────────────
 
 const ALLOWED_PROXY_PROTOCOLS = new Set(["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"]);
+const MAX_PROXIES_IN_POOL = 100;
 
 function isPrivateOrLoopbackHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  let host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (!host) return true;
+  if (host.startsWith("::ffff:")) {
+    const tail = host.slice("::ffff:".length);
+    const hexMatch = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      host = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    } else {
+      host = tail;
+    }
+  }
   if (
     host === "localhost" ||
     host === "::1" ||
+    host === "::" ||
     host === "0.0.0.0" ||
     host.endsWith(".localhost") ||
     host.endsWith(".local")
@@ -324,7 +337,7 @@ function isPrivateOrLoopbackHost(hostname: string): boolean {
   }
 
   if (net.isIPv6(host)) {
-    if (host === "::1" || host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) {
+    if (host === "::1" || host === "::" || host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) {
       return true;
     }
   }
@@ -333,7 +346,8 @@ function isPrivateOrLoopbackHost(hostname: string): boolean {
 
 export function maskProxyUrl(raw: string): string {
   try {
-    const parsed = new URL(raw);
+    const candidate = raw.includes("://") ? raw : `http://${raw}`;
+    const parsed = new URL(candidate);
     const creds = parsed.username || parsed.password ? "***@" : "";
     const port = parsed.port ? `:${parsed.port}` : "";
     return `${parsed.protocol}//${creds}${parsed.hostname}${port}`;
@@ -347,26 +361,29 @@ export function validateAndNormalizeProxyUrl(
 ): { ok: true; normalized: string; masked: string } | { ok: false; error: string } {
   const trimmed = raw.trim();
   if (!trimmed) {
-    return { ok: false, error: "Proxy URL is empty." };
+    return { ok: false, error: "Proxy entry is empty." };
   }
   if (/[\r\n\s]/.test(trimmed)) {
-    return { ok: false, error: "Proxy URL cannot contain spaces or newlines." };
+    return { ok: false, error: "Proxy entry cannot contain spaces or newlines." };
   }
+
+  // Free proxy lists commonly use bare ip:port (or user:pass@ip:port); default bare entries to http://
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
 
   let parsed: URL;
   try {
-    parsed = new URL(trimmed);
+    parsed = new URL(withScheme);
   } catch {
     return {
       ok: false,
-      error: "Invalid proxy URL format. Expected http://user:pass@host:port or socks5://host:port.",
+      error: "Invalid proxy format. Expected ip:port or http://ip:port (or socks5://host:port).",
     };
   }
 
   if (!ALLOWED_PROXY_PROTOCOLS.has(parsed.protocol)) {
     return {
       ok: false,
-      error: `Unsupported proxy scheme "${parsed.protocol}". Use http://, https://, socks5://, or socks4://.`,
+      error: `Unsupported proxy scheme "${parsed.protocol}". Use ip:port, http://, https://, socks5://, or socks4://.`,
     };
   }
 
@@ -380,7 +397,7 @@ export function validateAndNormalizeProxyUrl(
   if (!parsed.port) {
     return {
       ok: false,
-      error: "Proxy URL must include a port number (e.g., :8080 or :1080).",
+      error: "Proxy entry must include a port number (e.g., 1.2.3.4:8080).",
     };
   }
 
@@ -389,14 +406,71 @@ export function validateAndNormalizeProxyUrl(
     return { ok: false, error: "Proxy port must be between 1 and 65535." };
   }
 
+  const normalized = parsed.toString().replace(/\/+$/, "");
   return {
     ok: true,
-    normalized: parsed.toString(),
-    masked: maskProxyUrl(parsed.toString()),
+    normalized,
+    masked: maskProxyUrl(normalized),
   };
 }
 
-export async function getStoredProxyUrl(): Promise<string | null> {
+export function parseAndValidateProxyList(
+  raw: string
+):
+  | { ok: true; proxies: string[]; maskedList: string[]; summary: string }
+  | { ok: false; error: string } {
+  if (typeof raw !== "string" || !raw.trim()) {
+    return { ok: false, error: "Proxy list is empty. Enter one or more ip:port proxies." };
+  }
+
+  const rawTokens: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const cleanedLine = line.trim();
+    if (!cleanedLine || cleanedLine.startsWith("#")) continue;
+    for (const part of cleanedLine.split(/[,;\s]+/)) {
+      const token = part.trim();
+      if (token) rawTokens.push(token);
+    }
+  }
+
+  if (rawTokens.length === 0) {
+    return { ok: false, error: "Proxy list is empty. Enter one or more ip:port proxies." };
+  }
+
+  if (rawTokens.length > MAX_PROXIES_IN_POOL) {
+    return {
+      ok: false,
+      error: `Too many proxies (${rawTokens.length}). Maximum allowed in the pool is ${MAX_PROXIES_IN_POOL}.`,
+    };
+  }
+
+  const proxies: string[] = [];
+  const maskedList: string[] = [];
+  const seen = new Set<string>();
+
+  for (let i = 0; i < rawTokens.length; i++) {
+    const token = rawTokens[i];
+    const check = validateAndNormalizeProxyUrl(token);
+    if (!check.ok) {
+      const label = rawTokens.length > 1 ? `Proxy #${i + 1} (${maskProxyUrl(token)}): ` : "";
+      return { ok: false, error: `${label}${check.error}` };
+    }
+    if (!seen.has(check.normalized)) {
+      seen.add(check.normalized);
+      proxies.push(check.normalized);
+      maskedList.push(check.masked);
+    }
+  }
+
+  const summary =
+    maskedList.length === 1
+      ? maskedList[0]
+      : `${maskedList[0]} (+${maskedList.length - 1} more)`;
+
+  return { ok: true, proxies, maskedList, summary };
+}
+
+export async function getStoredProxyList(): Promise<string[]> {
   try {
     const [row] = await db
       .select({ value: appConfigTable.value })
@@ -404,15 +478,24 @@ export async function getStoredProxyUrl(): Promise<string | null> {
       .where(eq(appConfigTable.key, YT_PROXY_DB_KEY))
       .limit(1);
     const val = row?.value?.trim();
-    return val || null;
+    if (!val) return [];
+    const parsed = parseAndValidateProxyList(val);
+    return parsed.ok ? parsed.proxies : [];
   } catch {
-    return null;
+    return [];
   }
+}
+
+export async function getStoredProxyUrl(): Promise<string | null> {
+  const list = await getStoredProxyList();
+  return list[0] ?? null;
 }
 
 export async function getMaskedProxyStatus(): Promise<{
   set: boolean;
+  count: number;
   maskedHost: string | null;
+  maskedProxies: string[];
   updatedAt: string | null;
 }> {
   const [row] = await db
@@ -422,11 +505,26 @@ export async function getMaskedProxyStatus(): Promise<{
     .limit(1);
 
   if (!row?.value) {
-    return { set: false, maskedHost: null, updatedAt: null };
+    return { set: false, count: 0, maskedHost: null, maskedProxies: [], updatedAt: null };
   }
+
+  const parsed = parseAndValidateProxyList(row.value);
+  if (!parsed.ok) {
+    const fallback = maskProxyUrl(row.value);
+    return {
+      set: true,
+      count: 1,
+      maskedHost: fallback,
+      maskedProxies: [fallback],
+      updatedAt: row.updatedAt.toISOString(),
+    };
+  }
+
   return {
     set: true,
-    maskedHost: maskProxyUrl(row.value),
+    count: parsed.proxies.length,
+    maskedHost: parsed.summary,
+    maskedProxies: parsed.maskedList,
     updatedAt: row.updatedAt.toISOString(),
   };
 }

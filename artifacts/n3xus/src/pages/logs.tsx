@@ -37,7 +37,7 @@ export default function Logs() {
   const statusIcon = (s: string) => {
     if (s === "success") return <CheckCircle2 className="w-4 h-4 text-green-400 shrink-0" />;
     if (s === "failed")  return <XCircle className="w-4 h-4 text-destructive shrink-0" />;
-    return <Clock className="w-4 h-4 text-yellow-400 animate-pulse shrink-0" />;
+    return <Clock className="w-4 h-4 text-amber-400 shrink-0" />;
   };
 
   const statusColor = (s: string) =>
@@ -100,11 +100,7 @@ export default function Logs() {
         {/* Header */}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground mb-1 tracking-widest uppercase">
-              <div className="w-1.5 h-1.5 rounded-full bg-primary" />
-              Telemetry
-            </div>
-            <h1 className="text-2xl sm:text-3xl font-display font-bold text-foreground">Publish Logs</h1>
+            <h1 className="text-2xl sm:text-3xl font-display font-semibold tracking-tight text-foreground">Activity Logs</h1>
             <p className="text-muted-foreground text-sm mt-1">Complete history of all publish attempts and outcomes.</p>
           </div>
           <Button
@@ -112,7 +108,7 @@ export default function Logs() {
             variant="outline"
             onClick={exportCSV}
             disabled={filtered.length === 0}
-            className="gap-1.5 font-mono text-xs border-border text-muted-foreground hover:text-foreground self-start sm:self-auto shrink-0"
+            className="gap-1.5 font-medium text-xs min-h-[40px] border-border bg-card hover:bg-muted text-muted-foreground hover:text-foreground self-start sm:self-auto shrink-0"
           >
             <Download className="w-3.5 h-3.5" />
             Export CSV

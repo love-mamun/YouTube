@@ -55,12 +55,12 @@ function parseDuration(iso: string): string {
 }
 
 function HealthMeter({ score }: { score: number }) {
-  const color = score >= 75 ? "#00d4ff" : score >= 50 ? "#f59e0b" : "#ef4444";
+  const color = score >= 75 ? "#14b8a6" : score >= 50 ? "#f59e0b" : "#ef4444";
   return (
     <div className="space-y-1.5">
       <div className="flex justify-between items-center">
         <span className="text-xs font-mono text-muted-foreground">Channel Health</span>
-        <span className="text-lg font-bold font-mono" style={{ color }}>{score}/100</span>
+        <span className="text-lg font-bold font-mono tabular-nums" style={{ color }}>{score}/100</span>
       </div>
       <div className="h-2 rounded-full bg-muted/60 overflow-hidden">
         <motion.div
@@ -231,21 +231,16 @@ export default function Channel() {
   return (
     <Layout>
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }} className="space-y-8">
-        <div>
-          <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground mb-1 tracking-widest uppercase">
-            <div className="w-1.5 h-1.5 rounded-full bg-primary" />YouTube Data API v3
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl sm:text-3xl font-display font-semibold tracking-tight text-foreground">Channel Hub</h1>
+            <p className="text-muted-foreground text-sm mt-1">Your channel analytics, health score, and video optimizer.</p>
           </div>
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <h1 className="text-2xl sm:text-3xl font-display font-bold text-foreground">Channel Hub</h1>
-              <p className="text-muted-foreground text-sm mt-1">Your channel analytics, health score, and video optimizer.</p>
-            </div>
-            <Button variant="outline" size="sm" onClick={() => { fetchChannel(); fetchVideos(); }}
-              disabled={loadingChannel} className="gap-2 font-mono text-xs shrink-0">
-              <RefreshCw className={`w-3.5 h-3.5 ${loadingChannel ? "animate-spin" : ""}`} />
-              Refresh
-            </Button>
-          </div>
+          <Button variant="outline" size="sm" onClick={() => { fetchChannel(); fetchVideos(); }}
+            disabled={loadingChannel} className="gap-2 font-medium text-xs min-h-[40px] border-border bg-card hover:bg-muted shrink-0">
+            <RefreshCw className={`w-3.5 h-3.5 ${loadingChannel ? "animate-spin" : ""}`} />
+            Refresh
+          </Button>
         </div>
 
         {error && (
@@ -337,7 +332,7 @@ export default function Channel() {
                       value: channelInfo.statistics.videoCount > 0
                         ? formatCount(Math.round(channelInfo.statistics.viewCount / channelInfo.statistics.videoCount))
                         : "—",
-                      icon: Play, color: "text-cyan-400",
+                      icon: Play, color: "text-primary",
                     },
                     {
                       label: "Views / Subscriber",

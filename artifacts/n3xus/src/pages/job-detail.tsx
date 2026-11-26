@@ -1,10 +1,20 @@
 import { useParams, useLocation } from "wouter";
 import { motion } from "framer-motion";
 import {
-  useGetJob, useGetJobStatus, useGetJobContent, useGetJobThumbnails,
-  useUpdateJobContent, useProcessJob, useApproveJob, usePublishJob,
-  useSelectThumbnail, useListChannels,
-  getGetJobQueryKey, getGetJobStatusQueryKey, getGetJobContentQueryKey, getGetJobThumbnailsQueryKey,
+  useGetJob,
+  useGetJobStatus,
+  useGetJobContent,
+  useGetJobThumbnails,
+  useUpdateJobContent,
+  useProcessJob,
+  useApproveJob,
+  usePublishJob,
+  useSelectThumbnail,
+  useListChannels,
+  getGetJobQueryKey,
+  getGetJobStatusQueryKey,
+  getGetJobContentQueryKey,
+  getGetJobThumbnailsQueryKey,
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Layout } from "@/components/layout";
@@ -17,18 +27,46 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { useState, useEffect, useRef } from "react";
 import {
-  Play, CheckCircle2, Send, Loader2, ArrowLeft, Youtube,
-  Facebook, AlertTriangle, Copy, Check, Eye, EyeOff,
-  ThumbsUp, Upload, ExternalLink, Settings as SettingsIcon, Square,
+  Play,
+  CheckCircle2,
+  Send,
+  Loader2,
+  ArrowLeft,
+  Youtube,
+  Facebook,
+  AlertTriangle,
+  Copy,
+  Check,
+  Eye,
+  EyeOff,
+  ExternalLink,
+  Settings as SettingsIcon,
+  Square,
+  RotateCcw,
+  Image as ImageIcon,
 } from "lucide-react";
 import { parseJobErrorDiagnostic } from "@/lib/ytdlp-errors";
 
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
-const ACTIVE_STATUSES = ["pending", "downloading", "processing", "generating", "publishing"];
+const ACTIVE_STATUSES = [
+  "pending",
+  "downloading",
+  "processing",
+  "generating",
+  "publishing",
+];
 
 function extractYouTubeId(url: string): string | null {
   const match = url.match(/(?:v=|youtu\.be\/|shorts\/)([^&?/]+)/);
   return match?.[1] ?? null;
+}
+
+function detectPlatformLabel(url?: string | null): string {
+  if (!url) return "Video";
+  if (/youtube\.com\/shorts/i.test(url)) return "YouTube Shorts";
+  if (/youtube\.com|youtu\.be/i.test(url)) return "YouTube";
+  if (/facebook\.com|fb\.watch|fb\.com/i.test(url)) return "Facebook";
+  return "Direct URL";
 }
 
 export default function JobDetail() {
@@ -38,7 +76,11 @@ export default function JobDetail() {
   const queryClient = useQueryClient();
 
   const { data: job, isLoading } = useGetJob(jobId, {
-    query: { queryKey: getGetJobQueryKey(jobId), refetchInterval: 3000, enabled: !!jobId },
+    query: {
+      queryKey: getGetJobQueryKey(jobId),
+      refetchInterval: 3000,
+      enabled: !!jobId,
+    },
   });
 
   const isActive = ACTIVE_STATUSES.includes(job?.status || "");
@@ -65,10 +107,15 @@ export default function JobDetail() {
   const [hashtags, setHashtags] = useState("");
 
   const { data: channels } = useListChannels();
-  const ytChannels = (channels ?? []).filter((c) => c.platform === "youtube" && c.isActive);
-  const defaultChannel = ytChannels.find((c) => c.isDefault) ?? ytChannels[0] ?? null;
-  const [selectedChannelId, setSelectedChannelId] = useState<number | null>(null);
-  // Sync to default once channels load
+  const ytChannels = (channels ?? []).filter(
+    (c) => c.platform === "youtube" && c.isActive
+  );
+  const defaultChannel =
+    ytChannels.find((c) => c.isDefault) ?? ytChannels[0] ?? null;
+  const [selectedChannelId, setSelectedChannelId] = useState<number | null>(
+    null
+  );
+
   useEffect(() => {
     if (defaultChannel && selectedChannelId === null) {
       setSelectedChannelId(defaultChannel.id);
@@ -77,9 +124,13 @@ export default function JobDetail() {
 
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [showPreview, setShowPreview] = useState(false);
-  const [autoSaveStatus, setAutoSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
+  const [failedThumbs, setFailedThumbs] = useState<Record<number, boolean>>({});
+  const [failedPreviewImg, setFailedPreviewImg] = useState(false);
+  const [autoSaveStatus, setAutoSaveStatus] = useState<
+    "idle" | "saving" | "saved"
+  >("idle");
   const isDirty = useRef(false);
-  const autoSaveTimer = useRef<ReturnType<typeof setTimeout>>();
+  const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => {
     if (content) {
@@ -95,12 +146,14 @@ export default function JobDetail() {
     queryClient.invalidateQueries({ queryKey: getGetJobQueryKey(jobId) });
     queryClient.invalidateQueries({ queryKey: getGetJobStatusQueryKey(jobId) });
     queryClient.invalidateQueries({ queryKey: getGetJobContentQueryKey(jobId) });
-    queryClient.invalidateQueries({ queryKey: getGetJobThumbnailsQueryKey(jobId) });
+    queryClient.invalidateQueries({
+      queryKey: getGetJobThumbnailsQueryKey(jobId),
+    });
   };
 
-  const processJob    = useProcessJob({ mutation: { onSuccess: invalidate } });
-  const approveJob    = useApproveJob({ mutation: { onSuccess: invalidate } });
-  const publishJob    = usePublishJob({ mutation: { onSuccess: invalidate } });
+  const processJob = useProcessJob({ mutation: { onSuccess: invalidate } });
+  const approveJob = useApproveJob({ mutation: { onSuccess: invalidate } });
+  const publishJob = usePublishJob({ mutation: { onSuccess: invalidate } });
   const updateContent = useUpdateJobContent({
     mutation: {
       onSuccess: () => {
@@ -111,7 +164,9 @@ export default function JobDetail() {
       onError: () => setAutoSaveStatus("idle"),
     },
   });
-  const selectThumb   = useSelectThumbnail({ mutation: { onSuccess: invalidate } });
+  const selectThumb = useSelectThumbnail({
+    mutation: { onSuccess: invalidate },
+  });
   const [cancelling, setCancelling] = useState(false);
 
   const handleCancelJob = async () => {
@@ -134,7 +189,10 @@ export default function JobDetail() {
     setAutoSaveStatus("idle");
     autoSaveTimer.current = setTimeout(() => {
       setAutoSaveStatus("saving");
-      updateContent.mutate({ id: jobId, data: { title, description, tags, hashtags } });
+      updateContent.mutate({
+        id: jobId,
+        data: { title, description, tags, hashtags },
+      });
     }, 1500);
     return () => clearTimeout(autoSaveTimer.current);
   }, [title, description, tags, hashtags]);
@@ -164,23 +222,30 @@ export default function JobDetail() {
   }, [job?.status, jobId]);
 
   const selectedThumb = thumbnails?.find((t) => t.isSelected);
-  const previewThumbUrl = selectedThumb?.imageUrl ?? (() => {
-    if (!job?.youtubeUrl) return null;
-    const vid = extractYouTubeId(job.youtubeUrl);
-    return vid ? `https://img.youtube.com/vi/${vid}/hqdefault.jpg` : null;
-  })();
+  const previewThumbUrl =
+    selectedThumb?.imageUrl ??
+    (() => {
+      if (!job?.youtubeUrl) return null;
+      const vid = extractYouTubeId(job.youtubeUrl);
+      return vid ? `https://img.youtube.com/vi/${vid}/hqdefault.jpg` : null;
+    })();
+
+  useEffect(() => {
+    setFailedPreviewImg(false);
+  }, [previewThumbUrl]);
 
   const CopyBtn = ({ field, value }: { field: string; value: string }) => (
     <button
       type="button"
       onClick={() => handleCopy(field, value)}
-      className="p-1 rounded text-muted-foreground hover:text-foreground transition-colors"
+      className="min-w-[36px] min-h-[36px] sm:min-w-[30px] sm:min-h-[30px] flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
       title="Copy to clipboard"
+      aria-label={`Copy ${field}`}
     >
       {copiedField === field ? (
-        <Check className="w-3 h-3 text-green-400" />
+        <Check className="w-3.5 h-3.5 text-emerald-400" />
       ) : (
-        <Copy className="w-3 h-3" />
+        <Copy className="w-3.5 h-3.5" />
       )}
     </button>
   );
@@ -198,46 +263,61 @@ export default function JobDetail() {
   if (!job) {
     return (
       <Layout>
-        <div className="text-center py-16 text-muted-foreground">Mission not found.</div>
+        <div className="text-center py-16 text-muted-foreground text-sm">
+          Mission not found.
+        </div>
       </Layout>
     );
   }
 
   const platforms = (job.platforms || "youtube").split(",");
+  const tagCount = tags.split(",").filter((t) => t.trim()).length;
+  const hashtagCount = hashtags
+    .split(/\s+/)
+    .filter((h) => h.startsWith("#")).length;
 
   return (
     <Layout>
       <motion.div
-        initial={{ opacity: 0, y: 12 }}
+        initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.3 }}
-        className="space-y-4 sm:space-y-6"
+        transition={{ duration: 0.25 }}
+        className="space-y-5 sm:space-y-6"
       >
-        {/* Header */}
-        <div className="flex flex-col gap-3">
+        {/* Header & Primary Action Bar */}
+        <div className="space-y-3">
           <button
+            type="button"
             onClick={() => navigate("/jobs")}
-            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground font-mono transition-colors w-fit"
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors min-h-[44px] -ml-1 px-1"
           >
-            <ArrowLeft className="w-3 h-3" /> All Missions
+            <ArrowLeft className="w-4 h-4" /> All Missions
           </button>
 
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <div className="min-w-0">
-              <h1 className="text-xl sm:text-2xl font-display font-bold text-foreground line-clamp-2">
-                {job.title || job.originalTitle || "Mission Details"}
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="min-w-0 space-y-2">
+              <h1 className="text-xl sm:text-2xl font-display font-semibold tracking-tight text-foreground line-clamp-2">
+                {job.title || job.originalTitle || `Mission #${job.id}`}
               </h1>
-              <div className="flex flex-wrap items-center gap-2 mt-2">
+
+              {/* Unboxed metadata strip */}
+              <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-xs text-muted-foreground font-mono">
                 <StatusBadge status={job.status} />
+                <span aria-hidden="true">·</span>
+                <span>{detectPlatformLabel(job.youtubeUrl)}</span>
                 {job.youtubeUrl && (
-                  <a
-                    href={job.youtubeUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-muted-foreground hover:text-primary font-mono truncate max-w-[180px] sm:max-w-xs"
-                  >
-                    {job.youtubeUrl}
-                  </a>
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <a
+                      href={job.youtubeUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-primary hover:underline truncate max-w-[240px] sm:max-w-sm"
+                    >
+                      <span className="truncate">{job.youtubeUrl}</span>
+                      <ExternalLink className="w-3 h-3 shrink-0" />
+                    </a>
+                  </>
                 )}
               </div>
             </div>
@@ -247,329 +327,456 @@ export default function JobDetail() {
                 <Button
                   onClick={() => processJob.mutate({ id: jobId })}
                   disabled={processJob.isPending}
-                  className={`gap-2 font-mono text-xs flex-1 sm:flex-none ${
-                    job.status === "failed"
-                      ? "bg-amber-600 text-white hover:bg-amber-700"
-                      : "bg-primary text-primary-foreground hover:bg-primary/80"
-                  }`}
+                  className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90 font-medium text-sm min-h-[44px] px-4 flex-1 sm:flex-none"
                 >
-                  {processJob.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                  {job.status === "failed" ? "Retry Mission" : "Start Processing"}
+                  {processJob.isPending ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : job.status === "failed" ? (
+                    <RotateCcw className="w-4 h-4" />
+                  ) : (
+                    <Play className="w-4 h-4" />
+                  )}
+                  {job.status === "failed"
+                    ? "Retry Mission"
+                    : "Start Processing"}
                 </Button>
               )}
+
               {job.status === "ready" && (
                 <Button
                   onClick={() => approveJob.mutate({ id: jobId })}
                   disabled={approveJob.isPending}
                   title="Ctrl+S"
-                  className="gap-2 bg-green-600 text-white hover:bg-green-700 font-mono text-xs flex-1 sm:flex-none"
+                  className="gap-2 bg-emerald-600 text-white hover:bg-emerald-500 font-medium text-sm min-h-[44px] px-4 flex-1 sm:flex-none"
                 >
-                  {approveJob.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
-                  Approve
+                  {approveJob.isPending ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4" />
+                  )}
+                  Approve Mission
                 </Button>
               )}
+
               {job.status === "approved" && (
-                <div className="flex items-center gap-2 flex-1 sm:flex-none">
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
                   {ytChannels.length > 1 && (
                     <select
                       value={selectedChannelId ?? ""}
-                      onChange={(e) => setSelectedChannelId(e.target.value ? parseInt(e.target.value, 10) : null)}
-                      className="h-8 rounded-md border border-border bg-background px-2 text-xs font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                      onChange={(e) =>
+                        setSelectedChannelId(
+                          e.target.value ? parseInt(e.target.value, 10) : null
+                        )
+                      }
+                      className="min-h-[44px] rounded-md border border-border bg-card px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
                     >
                       {ytChannels.map((ch) => (
                         <option key={ch.id} value={ch.id}>
-                          {ch.channelName}{ch.isDefault ? " ★" : ""}
+                          {ch.channelName}
+                          {ch.isDefault ? " (Default)" : ""}
                         </option>
                       ))}
                     </select>
                   )}
                   <Button
-                    onClick={() => publishJob.mutate({
-                      id: jobId,
-                      data: { platforms: job.platforms || "youtube", channelId: selectedChannelId ?? undefined },
-                    })}
+                    onClick={() =>
+                      publishJob.mutate({
+                        id: jobId,
+                        data: {
+                          platforms: job.platforms || "youtube",
+                          channelId: selectedChannelId ?? undefined,
+                        },
+                      })
+                    }
                     disabled={publishJob.isPending}
-                    className="gap-2 bg-secondary text-secondary-foreground hover:bg-secondary/80 font-mono text-xs flex-1 sm:flex-none"
+                    className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90 font-medium text-sm min-h-[44px] px-4 flex-1 sm:flex-none"
                   >
-                    {publishJob.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                    {publishJob.isPending ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Send className="w-4 h-4" />
+                    )}
                     Publish Now
                   </Button>
                 </div>
               )}
+
               {isActive && job.status !== "pending" && (
                 <Button
                   variant="destructive"
                   onClick={handleCancelJob}
                   disabled={cancelling}
-                  className="gap-2 font-mono text-xs flex-1 sm:flex-none"
+                  className="gap-2 font-medium text-sm min-h-[44px] px-4 flex-1 sm:flex-none"
                 >
-                  {cancelling ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5 fill-current" />}
-                  {job.status === "publishing" ? "Stop / Reset" : "Stop Mission"}
+                  {cancelling ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Square className="w-3.5 h-3.5 fill-current" />
+                  )}
+                  {job.status === "publishing"
+                    ? "Stop & Reset"
+                    : "Stop Mission"}
                 </Button>
               )}
             </div>
           </div>
         </div>
 
-        {/* Pipeline */}
-        <Card className="p-4 sm:p-6 border-border bg-card/80 backdrop-blur-sm">
-          <h2 className="text-xs font-mono uppercase tracking-widest text-muted-foreground mb-4">Pipeline Status</h2>
-          <JobPipeline currentStatus={job.status} progress={status?.progress ?? job.progress ?? 0} />
-          {status?.currentStep && (
-            <p className="text-xs text-muted-foreground font-mono mt-3">
-              <span className="text-primary">&#x25B6;</span> {status.currentStep}
+        {/* Pipeline Status Card */}
+        <Card className="p-4 sm:p-6 border-border bg-card space-y-4">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-base font-display font-semibold text-foreground">
+              Pipeline Status
+            </h2>
+            {isActive && (
+              <span className="text-xs font-mono tabular-nums text-primary">
+                {status?.progress ?? job.progress ?? 0}% overall
+              </span>
+            )}
+          </div>
+
+          <JobPipeline
+            currentStatus={job.status}
+            progress={status?.progress ?? job.progress ?? 0}
+          />
+
+          {status?.currentStep && job.status !== "failed" && (
+            <p className="text-xs text-muted-foreground font-mono pt-1">
+              {status.currentStep}
             </p>
           )}
-          {job.errorMessage && (() => {
-            const diag = parseJobErrorDiagnostic(job.errorMessage);
-            return (
-              <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/10 p-3.5 space-y-2.5">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-2 text-xs font-mono font-semibold text-destructive">
-                    <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                    <span>{diag.title}</span>
+
+          {job.errorMessage &&
+            (() => {
+              const diag = parseJobErrorDiagnostic(job.errorMessage);
+              return (
+                <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-4 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <div className="flex items-start gap-2.5">
+                      <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                      <div>
+                        <h3 className="text-sm font-semibold text-red-200">
+                          {diag.title}
+                        </h3>
+                        <p className="text-xs text-foreground/85 mt-1 leading-relaxed break-words">
+                          {diag.summary}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {job.status === "failed" && (
+                        <Button
+                          size="sm"
+                          onClick={() => processJob.mutate({ id: jobId })}
+                          disabled={processJob.isPending}
+                          className="min-h-[40px] text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          Retry Mission
+                        </Button>
+                      )}
+                      {diag.showSettingsLink && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => navigate("/settings")}
+                          className="min-h-[40px] text-xs font-medium gap-1.5 border-border bg-card hover:bg-muted"
+                        >
+                          <SettingsIcon className="w-3.5 h-3.5" /> Open Settings
+                        </Button>
+                      )}
+                    </div>
                   </div>
-                  {diag.showSettingsLink && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => navigate("/settings")}
-                      className="h-6 px-2 text-[11px] font-mono gap-1 border-destructive/40 text-foreground hover:bg-destructive/15 shrink-0"
-                    >
-                      <SettingsIcon className="w-3 h-3" /> Open Settings
-                    </Button>
+
+                  {diag.tips.length > 0 && (
+                    <ul className="space-y-1.5 text-xs text-muted-foreground pt-2.5 border-t border-red-500/20 list-disc list-inside">
+                      {diag.tips.map((tip, idx) => (
+                        <li key={idx}>{tip}</li>
+                      ))}
+                    </ul>
                   )}
                 </div>
-                <p className="text-xs text-destructive/90 font-mono break-words">{diag.summary}</p>
-                {diag.tips.length > 0 && (
-                  <ul className="space-y-1 text-[11px] text-muted-foreground list-disc list-inside pt-1 border-t border-destructive/20">
-                    {diag.tips.map((tip, idx) => (
-                      <li key={idx}>{tip}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            );
-          })()}
+              );
+            })()}
         </Card>
 
-        {/* Content + Thumbnails */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
-
-          {/* Content */}
-          <Card className="p-4 sm:p-6 border-border bg-card/80 backdrop-blur-sm space-y-4">
-
-            {/* Card header */}
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="text-xs font-mono uppercase tracking-widest text-muted-foreground">Content</h2>
-            </div>
-
-            {/* Auto-save status */}
-            {autoSaveStatus !== "idle" && (
-              <div className="flex items-center gap-1.5 text-[10px] font-mono">
-                {autoSaveStatus === "saving" ? (
-                  <><Loader2 className="w-3 h-3 animate-spin text-muted-foreground" /><span className="text-muted-foreground">Auto-saving…</span></>
-                ) : (
-                  <><Check className="w-3 h-3 text-green-400" /><span className="text-green-400">Saved</span></>
+        {/* Balanced 2-Column Studio Workspace */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-stretch">
+          {/* Left: Metadata & Copy */}
+          <Card className="p-4 sm:p-6 border-border bg-card flex flex-col justify-between space-y-4">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-base font-display font-semibold text-foreground">
+                  Metadata & Copy
+                </h2>
+                {autoSaveStatus !== "idle" && (
+                  <div className="flex items-center gap-1.5 text-xs font-mono">
+                    {autoSaveStatus === "saving" ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />
+                        <span className="text-muted-foreground">Saving…</span>
+                      </>
+                    ) : (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span className="text-emerald-400">Saved</span>
+                      </>
+                    )}
+                  </div>
                 )}
               </div>
-            )}
 
-            <div className="space-y-3">
-              {/* Title */}
-              <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <Label className="text-xs font-mono text-muted-foreground">Title</Label>
-                  <div className="flex items-center gap-1.5">
-                    <span className={`text-[10px] font-mono ${title.length > 100 ? "text-destructive font-bold" : "text-muted-foreground"}`}>
-                      {title.length}/100
-                    </span>
-                    <CopyBtn field="title" value={title} />
+              <div className="space-y-3.5">
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs font-medium text-muted-foreground">
+                      Title
+                    </Label>
+                    <div className="flex items-center gap-1">
+                      <span
+                        className={`text-xs font-mono tabular-nums ${
+                          title.length > 100
+                            ? "text-red-400 font-semibold"
+                            : "text-muted-foreground"
+                        }`}
+                      >
+                        {title.length}/100
+                      </span>
+                      <CopyBtn field="title" value={title} />
+                    </div>
                   </div>
+                  <Input
+                    value={title}
+                    onChange={handleFieldChange(setTitle)}
+                    className="text-sm bg-muted/50 border-border focus:border-primary min-h-[44px] h-11"
+                    placeholder="Video title..."
+                  />
                 </div>
-                <Input
-                  value={title}
-                  onChange={handleFieldChange(setTitle)}
-                  className="font-mono text-sm bg-muted border-border focus:border-primary"
-                  placeholder="Video title..."
-                />
-              </div>
 
-              {/* Description */}
-              <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <Label className="text-xs font-mono text-muted-foreground">Description</Label>
-                  <div className="flex items-center gap-1.5">
-                    <span className={`text-[10px] font-mono ${description.length > 5000 ? "text-destructive font-bold" : "text-muted-foreground"}`}>
-                      {description.length.toLocaleString()}/5000
-                    </span>
-                    <CopyBtn field="description" value={description} />
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs font-medium text-muted-foreground">
+                      Description
+                    </Label>
+                    <div className="flex items-center gap-1">
+                      <span
+                        className={`text-xs font-mono tabular-nums ${
+                          description.length > 5000
+                            ? "text-red-400 font-semibold"
+                            : "text-muted-foreground"
+                        }`}
+                      >
+                        {description.length.toLocaleString()}/5000
+                      </span>
+                      <CopyBtn field="description" value={description} />
+                    </div>
                   </div>
+                  <Textarea
+                    value={description}
+                    onChange={handleFieldChange(setDescription)}
+                    rows={6}
+                    className="text-sm bg-muted/50 border-border focus:border-primary resize-y"
+                    placeholder="Video description..."
+                  />
                 </div>
-                <Textarea
-                  value={description}
-                  onChange={handleFieldChange(setDescription)}
-                  rows={5}
-                  className="font-mono text-sm bg-muted border-border focus:border-primary resize-none"
-                  placeholder="Video description..."
-                />
-              </div>
 
-              {/* Tags */}
-              <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <Label className="text-xs font-mono text-muted-foreground">
-                    Tags
-                    <span className="ml-2 text-[10px] text-muted-foreground/60 font-normal">
-                      {tags.split(",").filter((t) => t.trim()).length} tags
-                    </span>
-                  </Label>
-                  <CopyBtn field="tags" value={tags} />
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs font-medium text-muted-foreground">
+                      Tags{" "}
+                      <span className="ml-1.5 text-xs font-mono tabular-nums text-muted-foreground/70">
+                        · {tagCount}
+                      </span>
+                    </Label>
+                    <CopyBtn field="tags" value={tags} />
+                  </div>
+                  <Input
+                    value={tags}
+                    onChange={handleFieldChange(setTags)}
+                    className="font-mono text-xs bg-muted/50 border-border focus:border-primary min-h-[44px] h-11"
+                    placeholder="tag1, tag2, tag3..."
+                  />
                 </div>
-                <Input
-                  value={tags}
-                  onChange={handleFieldChange(setTags)}
-                  className="font-mono text-sm bg-muted border-border focus:border-primary"
-                  placeholder="tag1, tag2, tag3..."
-                />
-              </div>
 
-              {/* Hashtags */}
-              <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <Label className="text-xs font-mono text-muted-foreground">
-                    Hashtags
-                    <span className="ml-2 text-[10px] text-muted-foreground/60 font-normal">
-                      {hashtags.split(/\s+/).filter((h) => h.startsWith("#")).length} tags
-                    </span>
-                  </Label>
-                  <CopyBtn field="hashtags" value={hashtags} />
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs font-medium text-muted-foreground">
+                      Hashtags{" "}
+                      <span className="ml-1.5 text-xs font-mono tabular-nums text-muted-foreground/70">
+                        · {hashtagCount}
+                      </span>
+                    </Label>
+                    <CopyBtn field="hashtags" value={hashtags} />
+                  </div>
+                  <Input
+                    value={hashtags}
+                    onChange={handleFieldChange(setHashtags)}
+                    className="font-mono text-xs bg-muted/50 border-border focus:border-primary min-h-[44px] h-11"
+                    placeholder="#shorts #trending..."
+                  />
                 </div>
-                <Input
-                  value={hashtags}
-                  onChange={handleFieldChange(setHashtags)}
-                  className="font-mono text-sm bg-muted border-border focus:border-primary"
-                  placeholder="#trending #viral..."
-                />
               </div>
-
-              <p className="text-[10px] font-mono text-muted-foreground/40">
-                ⌨ Ctrl+S approve · edits auto-save after 1.5s
-              </p>
             </div>
+
+            <p className="text-xs text-muted-foreground/70 pt-2 border-t border-border/70">
+              Edits auto-save after 1.5s · Press{" "}
+              <span className="font-mono text-foreground/80">Ctrl+S</span> when
+              ready to approve.
+            </p>
           </Card>
 
-          {/* Thumbnails */}
-          <Card className="p-4 sm:p-6 border-border bg-card/80 backdrop-blur-sm space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xs font-mono uppercase tracking-widest text-muted-foreground">Thumbnail Variants</h2>
-              {previewThumbUrl && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setShowPreview(!showPreview)}
-                  className="gap-1 text-[10px] font-mono text-muted-foreground hover:text-primary h-6 px-2"
-                >
-                  {showPreview ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-                  Preview
-                </Button>
-              )}
-            </div>
+          {/* Right: Preview, Thumbnails & Destinations */}
+          <Card className="p-4 sm:p-6 border-border bg-card flex flex-col justify-between space-y-5">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-base font-display font-semibold text-foreground">
+                  Thumbnails & Preview
+                </h2>
+                {previewThumbUrl && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setShowPreview((p) => !p)}
+                    className="gap-1.5 text-xs font-medium min-h-[36px] border-border bg-muted/40 hover:bg-muted"
+                  >
+                    {showPreview ? (
+                      <EyeOff className="w-3.5 h-3.5" />
+                    ) : (
+                      <Eye className="w-3.5 h-3.5" />
+                    )}
+                    {showPreview ? "Hide Preview" : "YouTube Preview"}
+                  </Button>
+                )}
+              </div>
 
-            {/* YouTube Publish Preview */}
-            {showPreview && previewThumbUrl && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                className="overflow-hidden"
-              >
-                <div className="bg-muted/40 rounded-lg p-3 border border-border/50">
-                  <p className="text-[10px] font-mono text-primary mb-2 uppercase tracking-widest">YouTube Preview</p>
-                  <div className="max-w-[240px] mx-auto">
-                    <div className="relative rounded overflow-hidden">
-                      <img
-                        src={previewThumbUrl}
-                        alt="Preview"
-                        className="w-full aspect-video object-cover"
-                        onError={(e) => {
-                          (e.target as HTMLImageElement).src =
-                            "https://placehold.co/320x180/1a1a2e/00d4ff?text=Preview";
-                        }}
-                      />
-                      <div className="absolute bottom-1 right-1 bg-black/90 text-white text-[9px] font-mono px-1 rounded">
+              {showPreview && previewThumbUrl && (
+                <div className="rounded-lg bg-muted/40 p-3.5 border border-border/80 space-y-2.5">
+                  <p className="text-xs font-medium text-primary">
+                    Feed Card Preview
+                  </p>
+                  <div className="max-w-[280px]">
+                    <div className="relative rounded-md overflow-hidden bg-muted">
+                      {!failedPreviewImg ? (
+                        <img
+                          src={previewThumbUrl}
+                          alt="YouTube preview"
+                          className="w-full aspect-video object-cover"
+                          onError={() => setFailedPreviewImg(true)}
+                        />
+                      ) : (
+                        <div className="w-full aspect-video flex flex-col items-center justify-center gap-1.5 text-muted-foreground">
+                          <ImageIcon className="w-6 h-6" />
+                          <span className="text-xs">Preview unavailable</span>
+                        </div>
+                      )}
+                      <div className="absolute bottom-1.5 right-1.5 bg-black/85 text-white text-[11px] font-mono tabular-nums px-1.5 py-0.5 rounded">
                         0:00
                       </div>
                     </div>
-                    <div className="mt-1.5 flex gap-2">
-                      <div className="w-7 h-7 rounded-full bg-primary/20 border border-primary/30 shrink-0 mt-0.5" />
+                    <div className="mt-2.5 flex gap-2.5">
+                      <div className="w-8 h-8 rounded-full bg-primary/15 border border-primary/30 shrink-0" />
                       <div className="min-w-0">
-                        <p className="text-xs font-medium text-foreground line-clamp-2 leading-tight">
+                        <p className="text-sm font-medium text-foreground line-clamp-2 leading-snug">
                           {title || "Your video title here"}
                         </p>
-                        <p className="text-[10px] text-muted-foreground font-mono mt-0.5">N3XUS Channel · Just now</p>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          N3XUS Channel · Just now
+                        </p>
                       </div>
                     </div>
                   </div>
                 </div>
-              </motion.div>
-            )}
+              )}
 
-            {!thumbnails || thumbnails.length === 0 ? (
-              <div className="flex items-center justify-center h-40 text-muted-foreground text-xs font-mono border border-dashed border-border rounded">
-                Thumbnails generated after processing
-              </div>
-            ) : (
-              <div className="grid grid-cols-2 gap-3">
-                {thumbnails.map((thumb) => (
-                  <button
-                    key={thumb.id}
-                    onClick={() => selectThumb.mutate({ id: jobId, data: { thumbnailId: thumb.id } })}
-                    className={`relative rounded overflow-hidden border-2 transition-all active:scale-95 ${
-                      thumb.isSelected
-                        ? "border-primary shadow-[0_0_12px_hsl(var(--primary)/0.4)]"
-                        : "border-border hover:border-muted-foreground/50"
-                    }`}
+              {!thumbnails || thumbnails.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-44 text-muted-foreground text-xs border border-dashed border-border rounded-lg gap-2">
+                  <ImageIcon className="w-5 h-5 opacity-70" />
+                  <span>Thumbnails appear after processing completes</span>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  {thumbnails.map((thumb) => {
+                    const isBroken = !!failedThumbs[thumb.id];
+                    return (
+                      <button
+                        type="button"
+                        key={thumb.id}
+                        onClick={() =>
+                          selectThumb.mutate({
+                            id: jobId,
+                            data: { thumbnailId: thumb.id },
+                          })
+                        }
+                        className={`relative rounded-lg overflow-hidden border-2 transition-all active:scale-[0.98] text-left bg-muted/40 ${
+                          thumb.isSelected
+                            ? "border-primary ring-2 ring-primary/25"
+                            : "border-border hover:border-muted-foreground/60"
+                        }`}
+                      >
+                        {!isBroken ? (
+                          <img
+                            src={thumb.imageUrl}
+                            alt={
+                              thumb.label ||
+                              `Variant ${thumb.variantIndex + 1}`
+                            }
+                            className="w-full aspect-video object-cover"
+                            onError={() =>
+                              setFailedThumbs((prev) => ({
+                                ...prev,
+                                [thumb.id]: true,
+                              }))
+                            }
+                          />
+                        ) : (
+                          <div className="w-full aspect-video flex flex-col items-center justify-center gap-1 text-muted-foreground bg-muted/60">
+                            <ImageIcon className="w-5 h-5" />
+                            <span className="text-[11px]">
+                              Variant {thumb.variantIndex + 1}
+                            </span>
+                          </div>
+                        )}
+                        {thumb.isSelected && (
+                          <div className="absolute top-1.5 right-1.5 bg-primary text-primary-foreground text-[10px] font-semibold px-1.5 py-0.5 rounded">
+                            Selected
+                          </div>
+                        )}
+                        <div className="px-2.5 py-1.5 text-xs font-medium text-foreground truncate bg-card/90 border-t border-border/60">
+                          {thumb.label || `Variant ${thumb.variantIndex + 1}`}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Target Destinations */}
+            <div className="pt-4 border-t border-border/70 space-y-2.5">
+              <h3 className="text-xs font-medium text-muted-foreground">
+                Target Destinations
+              </h3>
+              <div className="flex flex-wrap gap-3">
+                {platforms.map((p) => (
+                  <div
+                    key={p}
+                    className="inline-flex items-center gap-2 text-sm font-medium text-foreground"
                   >
-                    <img
-                      src={thumb.imageUrl}
-                      alt={thumb.label || `Variant ${thumb.variantIndex + 1}`}
-                      className="w-full aspect-video object-cover"
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).src =
-                          "https://placehold.co/320x180/1a1a2e/00d4ff?text=Thumbnail";
-                      }}
-                    />
-                    {thumb.isSelected && (
-                      <div className="absolute top-1 right-1 bg-primary text-primary-foreground text-[9px] font-mono px-1 rounded">
-                        ✓
-                      </div>
+                    {p === "youtube" || p === "youtube-shorts" ? (
+                      <Youtube className="w-4 h-4 text-red-500 shrink-0" />
+                    ) : (
+                      <Facebook className="w-4 h-4 text-blue-500 shrink-0" />
                     )}
-                    <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-white text-[10px] font-mono px-2 py-1 truncate">
-                      {thumb.label || `Variant ${thumb.variantIndex + 1}`}
-                    </div>
-                  </button>
+                    <span className="capitalize">
+                      {p.replace("-", " ")}
+                    </span>
+                  </div>
                 ))}
               </div>
-            )}
+            </div>
           </Card>
         </div>
-
-        {/* Target Platforms */}
-        <Card className="p-4 sm:p-6 border-border bg-card/80 backdrop-blur-sm">
-          <h2 className="text-xs font-mono uppercase tracking-widest text-muted-foreground mb-4">Target Platforms</h2>
-          <div className="flex flex-wrap gap-2 sm:gap-3">
-            {platforms.map((p) => (
-              <div key={p} className="flex items-center gap-2 bg-muted px-3 sm:px-4 py-2 rounded border border-border">
-                {p === "youtube" || p === "youtube-shorts" ? (
-                  <Youtube className="w-4 h-4 text-red-500 shrink-0" />
-                ) : (
-                  <Facebook className="w-4 h-4 text-blue-500 shrink-0" />
-                )}
-                <span className="text-sm font-medium capitalize">{p}</span>
-              </div>
-            ))}
-          </div>
-        </Card>
       </motion.div>
     </Layout>
   );

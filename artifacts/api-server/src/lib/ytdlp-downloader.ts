@@ -9,7 +9,7 @@ import {
   JS_RUNTIME_ARGS,
   CHROME_UA,
   acquireJobCookieCopy,
-  getStoredProxyUrl,
+  getStoredProxyList,
   detectPotProvider,
   classifyYtDlpError,
   maskProxyUrl,
@@ -69,6 +69,49 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     };
     signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+let proxyRotationCursor = 0;
+
+function rotateProxyPool<T>(list: T[]): T[] {
+  if (list.length <= 1) return [...list];
+  const offset = proxyRotationCursor % list.length;
+  proxyRotationCursor = (proxyRotationCursor + 1) % 1_000_000;
+  return [...list.slice(offset), ...list.slice(0, offset)];
+}
+
+async function checkProxyReachability(
+  proxyUrl: string,
+  timeoutMs = 3000
+): Promise<{ ok: boolean; error: string | null }> {
+  try {
+    const parsed = new URL(proxyUrl);
+    const host = parsed.hostname.replace(/^\[|\]$/g, "");
+    const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+    if (!host || Number.isNaN(port) || port < 1 || port > 65535) {
+      return { ok: false, error: "Invalid proxy host or port" };
+    }
+    await new Promise<void>((resolve, reject) => {
+      const socket = net.createConnection({ host, port, timeout: timeoutMs }, () => {
+        socket.destroy();
+        resolve();
+      });
+      socket.on("error", (e) => {
+        socket.destroy();
+        reject(e);
+      });
+      socket.on("timeout", () => {
+        socket.destroy();
+        reject(new Error(`Timed out (${Math.round(timeoutMs / 1000)}s)`));
+      });
+    });
+    return { ok: true, error: null };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Failed to reach proxy host",
+    };
+  }
 }
 
 function buildStrategies(hasCookies: boolean, hasPot: boolean): ClientStrategy[] {
@@ -371,10 +414,26 @@ async function probeVideoShortEdge(filePath: string): Promise<{ minDim: number; 
 
 export async function fetchYtDlpMetadataShared(url: string): Promise<YtDlpMeta> {
   const cookieCopy = await acquireJobCookieCopy("meta");
-  const proxyUrl = await getStoredProxyUrl();
+  const proxyList = await getStoredProxyList();
   const pot = await detectPotProvider();
 
   try {
+    let metaProxyPool: Array<string | null> = [null];
+    if (proxyList.length > 0) {
+      const checks = await Promise.all(
+        proxyList.map(async (proxy) => ({
+          proxy,
+          ...(await checkProxyReachability(proxy, 2500)),
+        }))
+      );
+      const reachable = checks.filter((c) => c.ok).map((c) => c.proxy);
+      if (reachable.length === 0) {
+        logger.warn({ url, configuredProxies: proxyList.length }, "No configured proxies reachable for metadata fetch");
+        return {};
+      }
+      metaProxyPool = rotateProxyPool(reachable).slice(0, 3);
+    }
+
     const strategies = buildStrategies(cookieCopy.hasCookies, pot.mode !== "none");
     // Try primary strategy, and if it fails fall back to an android_vr client without cookies
     const candidates: ClientStrategy[] = [strategies[0]];
@@ -388,38 +447,54 @@ export async function fetchYtDlpMetadataShared(url: string): Promise<YtDlpMeta> 
       candidates.push(fallbackVr);
     }
 
-    for (const chosen of candidates) {
-      const extractorArgs = buildExtractorArgsForStrategy(chosen);
+    for (const activeProxy of metaProxyPool) {
+      for (const chosen of candidates) {
+        const extractorArgs = buildExtractorArgsForStrategy(chosen);
 
-      const args: string[] = [
-        "--dump-json",
-        "--no-playlist",
-        "--skip-download",
-        "--ignore-no-formats-error",
-        "--socket-timeout", "25",
-        "--retries", "1",
-        "--extractor-retries", "1",
-        ...JS_RUNTIME_ARGS,
-        ...(chosen.usePot ? pot.extractorArgs : []),
-        ...extractorArgs,
-        ...(chosen.useCookies && cookieCopy.path
-          ? chosen.client === "web"
-            ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
-            : ["--cookies", cookieCopy.path]
-          : []),
-        ...(proxyUrl ? ["--proxy", proxyUrl] : []),
-        url,
-      ];
+        const args: string[] = [
+          "--dump-json",
+          "--no-playlist",
+          "--skip-download",
+          "--ignore-no-formats-error",
+          "--socket-timeout", "25",
+          "--retries", "1",
+          "--extractor-retries", "1",
+          ...JS_RUNTIME_ARGS,
+          ...(chosen.usePot ? pot.extractorArgs : []),
+          ...extractorArgs,
+          ...(chosen.useCookies && cookieCopy.path
+            ? chosen.client === "web"
+              ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
+              : ["--cookies", cookieCopy.path]
+            : []),
+          ...(activeProxy ? ["--proxy", activeProxy] : []),
+          url,
+        ];
 
-      try {
-        const { stdout } = await spawnYtDlpRaw(args, { timeoutMs: 45_000, stallTimeoutMs: 35_000 });
-        const raw = stdout.trim();
-        if (raw) {
-          return JSON.parse(raw) as YtDlpMeta;
+        try {
+          const { stdout } = await spawnYtDlpRaw(args, { timeoutMs: 45_000, stallTimeoutMs: 35_000 });
+          const raw = stdout.trim();
+          if (raw) {
+            return JSON.parse(raw) as YtDlpMeta;
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            {
+              url,
+              client: chosen.client,
+              proxy: activeProxy ? maskProxyUrl(activeProxy) : null,
+              err: msg.slice(0, 220),
+            },
+            "yt-dlp metadata strategy failed"
+          );
+          if (
+            activeProxy &&
+            /ProxyError|Unable to connect to proxy|407 Proxy Authentication|SOCKS|proxyconnect|timed out/i.test(msg)
+          ) {
+            break;
+          }
         }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn({ url, client: chosen.client, err: msg.slice(0, 220) }, "yt-dlp metadata strategy failed");
       }
     }
     return {};
@@ -449,27 +524,12 @@ export async function downloadVideoWithResilience(options: {
   }
 
   const cookieCopy = await acquireJobCookieCopy(jobTag);
-  const proxyUrl = await getStoredProxyUrl();
-  const maskedProxy = proxyUrl ? maskProxyUrl(proxyUrl) : null;
+  const proxyList = await getStoredProxyList();
   const pot = await detectPotProvider();
   const strategies = buildStrategies(cookieCopy.hasCookies, pot.mode !== "none");
 
-  const commonArgs = [
-    ...sortArgs,
-    "--merge-output-format", "mp4",
-    "--no-playlist",
-    "--no-check-formats",
-    "--newline",
-    "--progress",
-    "--socket-timeout", "40",
-    "--concurrent-fragments", proxyUrl ? "1" : "2",
-    "--retries", "2",
-    "--extractor-retries", "2",
-    "--paths", `temp:${storeDir}`,
-    ...JS_RUNTIME_ARGS,
-    ...(proxyUrl ? ["--proxy", proxyUrl] : []),
-    "-o", outputPath,
-  ];
+  const perAttemptTotalMs = isStrict4K ? 720_000 : 360_000;
+  const perAttemptStallMs = isStrict4K ? 105_000 : 85_000;
 
   let lastError = "";
   let rateLimitHits = 0;
@@ -480,178 +540,273 @@ export async function downloadVideoWithResilience(options: {
   let noFormatsWithCookiesHit = false;
   let lastNoFormatsError = "";
   let stallHits = 0;
-  let proxyTimeoutHits = 0;
-
-  const perAttemptTotalMs = isStrict4K ? 720_000 : 360_000;
-  const perAttemptStallMs = isStrict4K ? 105_000 : 85_000;
+  let lastMaskedProxy: string | null = proxyList.length > 0 ? maskProxyUrl(proxyList[0]) : null;
 
   try {
-    for (let sIdx = 0; sIdx < strategies.length; sIdx++) {
-      if (signal?.aborted) {
-        throw new Error("[CANCELLED] Stopped by user");
+    let activeProxyPool: Array<string | null> = [null];
+    if (proxyList.length > 0) {
+      const checks = await Promise.all(
+        proxyList.map(async (proxy) => ({
+          proxy,
+          ...(await checkProxyReachability(proxy, 3000)),
+        }))
+      );
+      const reachableProxies = checks.filter((c) => c.ok).map((c) => c.proxy);
+      if (reachableProxies.length === 0) {
+        const summaryHost =
+          proxyList.length === 1
+            ? maskProxyUrl(proxyList[0])
+            : `${maskProxyUrl(proxyList[0])} (+${proxyList.length - 1} more)`;
+        throw new Error(
+          classifyYtDlpError(
+            `ProxyError: None of the ${proxyList.length} configured proxies could be reached right now.`,
+            {
+              quality,
+              usedCookies: cookieCopy.hasCookies,
+              usedProxy: true,
+              proxyMaskedHost: summaryHost,
+              potMode: pot.mode,
+            }
+          ).formattedMessage
+        );
       }
+      activeProxyPool = rotateProxyPool(reachableProxies);
+    }
 
-      const strat = strategies[sIdx];
-      const extractorArgs = buildExtractorArgsForStrategy(strat);
+    for (let pIdx = 0; pIdx < activeProxyPool.length; pIdx++) {
+      const activeProxy = activeProxyPool[pIdx];
+      const maskedActiveProxy = activeProxy ? maskProxyUrl(activeProxy) : null;
+      if (maskedActiveProxy) lastMaskedProxy = maskedActiveProxy;
+      const hasMoreProxies = pIdx < activeProxyPool.length - 1;
 
-      for (const fmt of uniqueFormats) {
+      const commonArgs = [
+        ...sortArgs,
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--no-check-formats",
+        "--newline",
+        "--progress",
+        "--socket-timeout", "40",
+        "--concurrent-fragments", activeProxy ? "1" : "2",
+        "--retries", "2",
+        "--extractor-retries", "2",
+        "--paths", `temp:${storeDir}`,
+        ...JS_RUNTIME_ARGS,
+        ...(activeProxy ? ["--proxy", activeProxy] : []),
+        "-o", outputPath,
+      ];
+
+      let proxyTimeoutHits = 0;
+      let proxyRateLimitHits = 0;
+      let rotateToNextProxy = false;
+
+      for (let sIdx = 0; sIdx < strategies.length && !rotateToNextProxy; sIdx++) {
         if (signal?.aborted) {
           throw new Error("[CANCELLED] Stopped by user");
         }
 
-        logger.info(
-          {
-            url,
-            client: strat.client,
-            quality: quality ?? "auto-1080p",
-            isStrict4K,
-            hasCookies: strat.useCookies && cookieCopy.hasCookies,
-            potMode: strat.usePot ? pot.mode : "none",
-            proxy: maskedProxy,
-            freeDiskMB: diskInfo.availableMB,
-          },
-          "Trying yt-dlp download strategy"
-        );
+        const strat = strategies[sIdx];
+        const extractorArgs = buildExtractorArgsForStrategy(strat);
 
-        try {
-          cleanupPrefixFiles(outputPath);
-
-          await spawnYtDlpRaw(
-            [
-              "-f", fmt,
-              ...extractorArgs,
-              ...(strat.usePot ? pot.extractorArgs : []),
-              ...(strat.useCookies && cookieCopy.path
-                ? strat.client === "web"
-                  ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
-                  : ["--cookies", cookieCopy.path]
-                : []),
-              ...commonArgs,
-              url,
-            ],
-            {
-              onProgress,
-              timeoutMs: perAttemptTotalMs,
-              stallTimeoutMs: perAttemptStallMs,
-              watchOutputPath: outputPath,
-              signal,
-            }
-          );
-
-          // Strict 4K verification via ffprobe (supports both 16:9 3840x2160 and 9:16 2160x3840)
-          if (isStrict4K && existsSync(outputPath)) {
-            const dims = await probeVideoShortEdge(outputPath);
-            if (dims && dims.minDim < 2160 && dims.maxDim < 3840) {
-              try { unlinkSync(outputPath); } catch { /* noop */ }
-              throw new Error(
-                `[4K_UNAVAILABLE] Strict 4K aborted: downloaded stream resolution was ${dims.minDim}p (< 2160p).`
-              );
-            }
-          }
-
-          logger.info({ url, client: strat.client, quality: quality ?? "auto-1080p" }, "Download succeeded");
-          return;
-        } catch (err) {
-          lastError = err instanceof Error ? err.message : String(err);
-          cleanupPrefixFiles(outputPath);
-
-          if (signal?.aborted || /Stopped by user|\[CANCELLED\]/i.test(lastError)) {
+        for (const fmt of uniqueFormats) {
+          if (signal?.aborted) {
             throw new Error("[CANCELLED] Stopped by user");
           }
 
-          logger.warn(
-            { url, client: strat.client, err: lastError.slice(0, 180) },
-            "yt-dlp strategy failed"
+          logger.info(
+            {
+              url,
+              client: strat.client,
+              quality: quality ?? "auto-1080p",
+              isStrict4K,
+              hasCookies: strat.useCookies && cookieCopy.hasCookies,
+              potMode: strat.usePot ? pot.mode : "none",
+              proxy: maskedActiveProxy,
+              proxyAttempt: activeProxy ? `${pIdx + 1}/${activeProxyPool.length}` : undefined,
+              freeDiskMB: diskInfo.availableMB,
+            },
+            "Trying yt-dlp download strategy"
           );
 
-          if (/ENOSPC|No space left on device|Disk quota exceeded|\[DISK_FULL\]/i.test(lastError)) {
-            throw new Error(
-              classifyYtDlpError(lastError, {
-                quality,
-                usedCookies: cookieCopy.hasCookies,
-                usedProxy: Boolean(proxyUrl),
-                proxyMaskedHost: maskedProxy,
-                potMode: pot.mode,
-              }).formattedMessage
-            );
-          }
+          try {
+            cleanupPrefixFiles(outputPath);
 
-          if (/ProxyError|Unable to connect to proxy|407 Proxy Authentication|SOCKS|proxyconnect/i.test(lastError)) {
-            throw new Error(
-              classifyYtDlpError(lastError, {
-                quality,
-                usedCookies: cookieCopy.hasCookies,
-                usedProxy: Boolean(proxyUrl),
-                proxyMaskedHost: maskedProxy,
-                potMode: pot.mode,
-              }).formattedMessage
+            await spawnYtDlpRaw(
+              [
+                "-f", fmt,
+                ...extractorArgs,
+                ...(strat.usePot ? pot.extractorArgs : []),
+                ...(strat.useCookies && cookieCopy.path
+                  ? strat.client === "web"
+                    ? ["--cookies", cookieCopy.path, "--user-agent", CHROME_UA]
+                    : ["--cookies", cookieCopy.path]
+                  : []),
+                ...commonArgs,
+                url,
+              ],
+              {
+                onProgress,
+                timeoutMs: perAttemptTotalMs,
+                stallTimeoutMs: perAttemptStallMs,
+                watchOutputPath: outputPath,
+                signal,
+              }
             );
-          }
 
-          if (proxyUrl && /timed out|TransportError|stalled/i.test(lastError)) {
-            proxyTimeoutHits++;
-            if (proxyTimeoutHits >= 2) {
+            // Strict 4K verification via ffprobe (supports both 16:9 3840x2160 and 9:16 2160x3840)
+            if (isStrict4K && existsSync(outputPath)) {
+              const dims = await probeVideoShortEdge(outputPath);
+              if (dims && dims.minDim < 2160 && dims.maxDim < 3840) {
+                try { unlinkSync(outputPath); } catch { /* noop */ }
+                throw new Error(
+                  `[4K_UNAVAILABLE] Strict 4K aborted: downloaded stream resolution was ${dims.minDim}p (< 2160p).`
+                );
+              }
+            }
+
+            logger.info(
+              {
+                url,
+                client: strat.client,
+                quality: quality ?? "auto-1080p",
+                proxy: maskedActiveProxy,
+              },
+              "Download succeeded"
+            );
+            return;
+          } catch (err) {
+            lastError = err instanceof Error ? err.message : String(err);
+            cleanupPrefixFiles(outputPath);
+
+            if (signal?.aborted || /Stopped by user|\[CANCELLED\]/i.test(lastError)) {
+              throw new Error("[CANCELLED] Stopped by user");
+            }
+
+            logger.warn(
+              {
+                url,
+                client: strat.client,
+                proxy: maskedActiveProxy,
+                err: lastError.slice(0, 180),
+              },
+              "yt-dlp strategy failed"
+            );
+
+            if (/ENOSPC|No space left on device|Disk quota exceeded|\[DISK_FULL\]/i.test(lastError)) {
               throw new Error(
                 classifyYtDlpError(lastError, {
                   quality,
                   usedCookies: cookieCopy.hasCookies,
-                  usedProxy: true,
-                  proxyMaskedHost: maskedProxy,
+                  usedProxy: Boolean(activeProxy),
+                  proxyMaskedHost: maskedActiveProxy,
                   potMode: pot.mode,
                 }).formattedMessage
               );
             }
-          }
 
-          if (/429|Too Many Requests/i.test(lastError)) {
-            rateLimitHits++;
-            if (rateLimitHits >= 2) {
+            if (/ProxyError|Unable to connect to proxy|407 Proxy Authentication|SOCKS|proxyconnect|Connection reset by peer|Connection refused/i.test(lastError)) {
+              if (hasMoreProxies) {
+                rotateToNextProxy = true;
+                break;
+              }
               throw new Error(
                 classifyYtDlpError(lastError, {
                   quality,
                   usedCookies: cookieCopy.hasCookies,
-                  usedProxy: Boolean(proxyUrl),
-                  proxyMaskedHost: maskedProxy,
+                  usedProxy: Boolean(activeProxy),
+                  proxyMaskedHost: maskedActiveProxy,
                   potMode: pot.mode,
                 }).formattedMessage
               );
             }
-          }
 
-          if (/Sign in to confirm you.?re not a bot|cookies are no longer valid|do-i-pass-cookies-to-yt-dlp/i.test(lastError)) {
-            if (strat.useCookies && cookieCopy.hasCookies) {
-              botCheckWithCookiesHit = true;
-            } else {
-              botCheckAnonHit = true;
+            if (activeProxy && /timed out|TransportError|stalled/i.test(lastError)) {
+              proxyTimeoutHits++;
+              if (proxyTimeoutHits >= 2) {
+                if (hasMoreProxies) {
+                  rotateToNextProxy = true;
+                  break;
+                }
+                throw new Error(
+                  classifyYtDlpError(lastError, {
+                    quality,
+                    usedCookies: cookieCopy.hasCookies,
+                    usedProxy: true,
+                    proxyMaskedHost: maskedActiveProxy,
+                    potMode: pot.mode,
+                  }).formattedMessage
+                );
+              }
             }
-          }
 
-          if (/Requested format is not available|\[4K_UNAVAILABLE\]/i.test(lastError) && isStrict4K) {
-            formatMiss4KHit = true;
-            if (!last4KFormatError || (strat.useCookies && cookieCopy.hasCookies)) {
-              last4KFormatError = lastError;
+            if (/429|Too Many Requests/i.test(lastError)) {
+              rateLimitHits++;
+              proxyRateLimitHits++;
+              if (proxyRateLimitHits >= 1 && hasMoreProxies) {
+                rotateToNextProxy = true;
+                break;
+              }
+              if (rateLimitHits >= 2) {
+                throw new Error(
+                  classifyYtDlpError(lastError, {
+                    quality,
+                    usedCookies: cookieCopy.hasCookies,
+                    usedProxy: Boolean(activeProxy),
+                    proxyMaskedHost: maskedActiveProxy,
+                    potMode: pot.mode,
+                  }).formattedMessage
+                );
+              }
             }
-          }
 
-          if (
-            strat.useCookies &&
-            cookieCopy.hasCookies &&
-            /No video formats found|n challenge solving failed|Signature solving failed|SABR-only/i.test(lastError)
-          ) {
-            noFormatsWithCookiesHit = true;
-            lastNoFormatsError = lastError;
-          }
+            if (activeProxy && /No video formats found/i.test(lastError) && hasMoreProxies) {
+              rotateToNextProxy = true;
+              break;
+            }
 
-          if (/stalled|timed out/i.test(lastError)) {
-            stallHits++;
-          }
+            if (/Sign in to confirm you.?re not a bot|cookies are no longer valid|do-i-pass-cookies-to-yt-dlp/i.test(lastError)) {
+              if (strat.useCookies && cookieCopy.hasCookies) {
+                botCheckWithCookiesHit = true;
+              } else {
+                botCheckAnonHit = true;
+              }
+            }
 
-          await sleep(1000, signal);
+            if (/Requested format is not available|\[4K_UNAVAILABLE\]/i.test(lastError) && isStrict4K) {
+              formatMiss4KHit = true;
+              if (!last4KFormatError || (strat.useCookies && cookieCopy.hasCookies)) {
+                last4KFormatError = lastError;
+              }
+            }
+
+            if (
+              strat.useCookies &&
+              cookieCopy.hasCookies &&
+              /No video formats found|n challenge solving failed|Signature solving failed|SABR-only/i.test(lastError)
+            ) {
+              noFormatsWithCookiesHit = true;
+              lastNoFormatsError = lastError;
+            }
+
+            if (/stalled|timed out/i.test(lastError)) {
+              stallHits++;
+            }
+
+            await sleep(1000, signal);
+          }
+        }
+
+        if (!rotateToNextProxy && sIdx < strategies.length - 1) {
+          await sleep(1200, signal);
         }
       }
 
-      if (sIdx < strategies.length - 1) {
-        await sleep(1200, signal);
+      if (hasMoreProxies) {
+        logger.info(
+          { url, failedProxy: maskedActiveProxy, nextProxyIndex: pIdx + 2, totalProxies: activeProxyPool.length },
+          "Rotating to next proxy in pool"
+        );
+        await sleep(600, signal);
       }
     }
 
@@ -669,11 +824,16 @@ export async function downloadVideoWithResilience(options: {
         ? `Download stalled waiting on YouTube stream (${lastError})`
         : lastError;
 
+    const summaryHost =
+      proxyList.length <= 1
+        ? lastMaskedProxy
+        : `${maskProxyUrl(proxyList[0])} (+${proxyList.length - 1} more)`;
+
     const classified = classifyYtDlpError(prioritizedError, {
       quality,
       usedCookies: cookieCopy.hasCookies && ((!formatMiss4KHit && !noFormatsWithCookiesHit) || botCheckWithCookiesHit),
-      usedProxy: Boolean(proxyUrl),
-      proxyMaskedHost: maskedProxy,
+      usedProxy: proxyList.length > 0,
+      proxyMaskedHost: summaryHost,
       potMode: pot.mode,
     });
     throw new Error(classified.formattedMessage);
@@ -685,7 +845,15 @@ export async function downloadVideoWithResilience(options: {
 export interface DiagnosticsReport {
   ytDlp: { ok: boolean; version: string | null; error: string | null };
   potServer: { ok: boolean; mode: "http" | "script" | "none"; endpoint: string | null };
-  proxy: { configured: boolean; maskedHost: string | null; ok: boolean | null; error: string | null };
+  proxy: {
+    configured: boolean;
+    count: number;
+    reachableCount: number;
+    maskedHost: string | null;
+    proxies: Array<{ maskedHost: string; ok: boolean; error: string | null }>;
+    ok: boolean | null;
+    error: string | null;
+  };
   storage: DiskSpaceInfo;
   probe: {
     attempted: boolean;
@@ -701,6 +869,7 @@ export interface DiagnosticsReport {
 export async function runYtDlpDiagnostics(opts: {
   testUrl?: string;
   proxyOverride?: string | null;
+  proxyListOverride?: string[] | null;
   runLiveProbe?: boolean;
 }): Promise<DiagnosticsReport> {
   let ytDlpVersion: string | null = null;
@@ -715,30 +884,48 @@ export async function runYtDlpDiagnostics(opts: {
   const pot = await detectPotProvider();
   const storage = getDiskSpaceInfo();
 
-  const effectiveProxy = opts.proxyOverride !== undefined ? opts.proxyOverride : await getStoredProxyUrl();
-  const maskedEffectiveProxy = effectiveProxy ? maskProxyUrl(effectiveProxy) : null;
+  const proxyList =
+    opts.proxyListOverride !== undefined
+      ? opts.proxyListOverride ?? []
+      : opts.proxyOverride !== undefined
+      ? opts.proxyOverride
+        ? [opts.proxyOverride]
+        : []
+      : await getStoredProxyList();
+
+  const maskedList = proxyList.map(maskProxyUrl);
+  const summaryMaskedHost =
+    maskedList.length === 0
+      ? null
+      : maskedList.length === 1
+      ? maskedList[0]
+      : `${maskedList[0]} (+${maskedList.length - 1} more)`;
+
   let proxyOk: boolean | null = null;
   let proxyErr: string | null = null;
+  let proxyStatuses: Array<{ maskedHost: string; ok: boolean; error: string | null }> = [];
+  let reachableProxies: string[] = [];
 
-  if (effectiveProxy && ytDlpVersion) {
-    try {
-      const parsed = new URL(effectiveProxy);
-      const port = Number(parsed.port);
-      await new Promise<void>((resolve, reject) => {
-        const socket = net.createConnection({ host: parsed.hostname, port, timeout: 4000 }, () => {
-          socket.destroy();
-          resolve();
-        });
-        socket.on("error", (e) => reject(e));
-        socket.on("timeout", () => {
-          socket.destroy();
-          reject(new Error("Proxy connection timed out (4s)"));
-        });
-      });
-      proxyOk = true;
-    } catch (err) {
-      proxyOk = false;
-      proxyErr = err instanceof Error ? err.message : "Failed to reach proxy host";
+  if (proxyList.length > 0 && ytDlpVersion) {
+    const checks = await Promise.all(
+      proxyList.map(async (proxy) => ({
+        proxy,
+        maskedHost: maskProxyUrl(proxy),
+        ...(await checkProxyReachability(proxy, 3500)),
+      }))
+    );
+    proxyStatuses = checks.map((c) => ({
+      maskedHost: c.maskedHost,
+      ok: c.ok,
+      error: c.error,
+    }));
+    reachableProxies = checks.filter((c) => c.ok).map((c) => c.proxy);
+    proxyOk = reachableProxies.length > 0;
+    if (!proxyOk) {
+      proxyErr =
+        proxyStatuses.length === 1
+          ? proxyStatuses[0]?.error || "Failed to reach proxy host"
+          : `All ${proxyStatuses.length} proxies failed connection check (${proxyStatuses[0]?.error || "timed out"})`;
     }
   }
 
@@ -750,8 +937,11 @@ export async function runYtDlpDiagnostics(opts: {
       endpoint: pot.mode === "http" ? pot.httpUrl : pot.scriptServerHome,
     },
     proxy: {
-      configured: Boolean(effectiveProxy),
-      maskedHost: maskedEffectiveProxy,
+      configured: proxyList.length > 0,
+      count: proxyList.length,
+      reachableCount: reachableProxies.length,
+      maskedHost: summaryMaskedHost,
+      proxies: proxyStatuses,
       ok: proxyOk,
       error: proxyErr,
     },
@@ -767,7 +957,7 @@ export async function runYtDlpDiagnostics(opts: {
     },
   };
 
-  if (opts.runLiveProbe === false || !ytDlpVersion || proxyOk === false) {
+  if (opts.runLiveProbe === false || !ytDlpVersion || (proxyList.length > 0 && reachableProxies.length === 0)) {
     return report;
   }
 
@@ -807,34 +997,40 @@ export async function runYtDlpDiagnostics(opts: {
       return heights.length > 0 ? Math.max(...heights) : null;
     };
 
+    const probeProxyPool: Array<string | null> =
+      reachableProxies.length > 0 ? reachableProxies.slice(0, 3) : [null];
+
     let lastRawErr = "";
     let lastClientUsed = strategies[0].client;
 
-    for (const chosen of strategies) {
-      lastClientUsed = chosen.client;
-      try {
-        const maxHeight = await runProbeAttempt(chosen, effectiveProxy);
-        report.probe.ok = true;
-        report.probe.clientUsed = chosen.client;
-        report.probe.maxHeight = maxHeight;
-        report.probe.has4k = maxHeight !== null ? maxHeight >= 2160 : false;
-        report.probe.message = maxHeight
-          ? `YouTube stream probe succeeded via ${chosen.client} (max ${maxHeight}p available).`
-          : `YouTube metadata probe succeeded via ${chosen.client}.`;
-        return report;
-      } catch (err) {
-        lastRawErr = err instanceof Error ? err.message : String(err);
+    for (const proxyArg of probeProxyPool) {
+      for (const chosen of strategies) {
+        lastClientUsed = chosen.client;
+        try {
+          const maxHeight = await runProbeAttempt(chosen, proxyArg);
+          report.probe.ok = true;
+          report.probe.clientUsed = chosen.client;
+          report.probe.maxHeight = maxHeight;
+          report.probe.has4k = maxHeight !== null ? maxHeight >= 2160 : false;
+          const viaSuffix = proxyArg ? ` through ${maskProxyUrl(proxyArg)}` : "";
+          report.probe.message = maxHeight
+            ? `YouTube stream probe succeeded via ${chosen.client}${viaSuffix} (max ${maxHeight}p available).`
+            : `YouTube metadata probe succeeded via ${chosen.client}${viaSuffix}.`;
+          return report;
+        } catch (err) {
+          lastRawErr = err instanceof Error ? err.message : String(err);
+        }
       }
     }
 
-    // If a proxy was configured and all proxied attempts failed, test direct connection once
-    // so the user knows whether their proxy IP is what broke YouTube format extraction.
+    // If proxies were configured and all proxied attempts failed, test direct connection once
+    // so the user knows whether their proxy IPs are what broke YouTube format extraction.
     let directHint = "";
-    if (effectiveProxy) {
+    if (reachableProxies.length > 0) {
       try {
         const directMax = await runProbeAttempt(strategies[0], null);
         if (directMax) {
-          directHint = ` Direct server check (bypassing proxy) succeeded at ${directMax}p — your configured proxy IP may be restricted or returning incomplete streams.`;
+          directHint = ` Direct server check (bypassing proxy) succeeded at ${directMax}p — your configured proxy IP(s) may be restricted or returning incomplete streams.`;
         }
       } catch {
         // ignore direct failure
@@ -843,8 +1039,8 @@ export async function runYtDlpDiagnostics(opts: {
 
     const classified = classifyYtDlpError(lastRawErr || "No playable video formats returned", {
       usedCookies: cookieCopy.hasCookies,
-      usedProxy: Boolean(effectiveProxy),
-      proxyMaskedHost: maskedEffectiveProxy,
+      usedProxy: proxyList.length > 0,
+      proxyMaskedHost: summaryMaskedHost,
       potMode: pot.mode,
     });
     report.probe.ok = false;
