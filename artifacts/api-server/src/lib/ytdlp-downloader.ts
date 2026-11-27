@@ -24,6 +24,8 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+import type { FormatSizeCandidate } from "./resource-guard";
+
 export interface YtDlpMeta {
   title?: string;
   description?: string;
@@ -35,6 +37,7 @@ export interface YtDlpMeta {
   id?: string;
   extractor?: string;
   webpage_url?: string;
+  formats?: FormatSizeCandidate[];
 }
 
 interface ClientStrategy {
@@ -728,9 +731,10 @@ export async function downloadVideoWithResilience(options: {
   onProgress?: (pct: number) => void;
   codec?: string | null;
   jobTag?: string;
+  maxFilesizeMB?: number | null;
   signal?: AbortSignal;
 }): Promise<void> {
-  const { url, quality, outputPath, onProgress, codec, jobTag = "dl", signal } = options;
+  const { url, quality, outputPath, onProgress, codec, jobTag = "dl", maxFilesizeMB, signal } = options;
   const { isStrict4K, sortArgs, formatSelectors } = buildDownloadFormatPlan({ quality, codec });
   const uniqueFormats = Array.from(new Set(formatSelectors));
   const storeDir = getVideoStoreDir();
@@ -812,6 +816,9 @@ export async function downloadVideoWithResilience(options: {
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--no-check-formats",
+        "--no-cache-dir",
+        "--no-keep-fragments",
+        ...(maxFilesizeMB && maxFilesizeMB > 0 ? ["--max-filesize", `${Math.floor(maxFilesizeMB)}M`] : []),
         "--newline",
         "--progress",
         "--socket-timeout", "40",
@@ -924,9 +931,12 @@ export async function downloadVideoWithResilience(options: {
               "yt-dlp strategy failed"
             );
 
-            if (/ENOSPC|No space left on device|Disk quota exceeded|\[DISK_FULL\]/i.test(lastError)) {
+            if (/ENOSPC|No space left on device|Disk quota exceeded|\[DISK_FULL\]|larger than max-filesize/i.test(lastError)) {
+              const normalizedDiskMsg = /larger than max-filesize/i.test(lastError)
+                ? `[DISK_FULL] Video stream exceeded safe temporary disk limit (${maxFilesizeMB ?? "?"} MB max for current free space). Retry at 1080p or lower quality.`
+                : lastError;
               throw new Error(
-                classifyYtDlpError(lastError, {
+                classifyYtDlpError(normalizedDiskMsg, {
                   quality,
                   usedCookies: cookieCopy.hasCookies,
                   usedProxy: Boolean(activeProxy),

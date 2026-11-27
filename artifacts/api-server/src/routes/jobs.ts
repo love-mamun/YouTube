@@ -122,7 +122,10 @@ router.delete("/jobs/:id", async (req, res): Promise<void> => {
     return;
   }
 
-  await db.delete(videoJobsTable).where(eq(videoJobsTable.id, params.data.id));
+  const id = params.data.id;
+  abortActiveJob(id, "Deleted by user");
+  await cleanupJobVideoFile(id);
+  await db.delete(videoJobsTable).where(eq(videoJobsTable.id, id));
   res.sendStatus(204);
 });
 
@@ -195,15 +198,15 @@ router.post("/jobs/:id/process", async (req, res): Promise<void> => {
     return;
   }
 
+  const [updated] = await db
+    .update(videoJobsTable)
+    .set({ status: "pending", progress: 2, errorMessage: null })
+    .where(eq(videoJobsTable.id, job.id))
+    .returning();
+
   startVideoProcessing(job.id, job.youtubeUrl || "").catch((err) => {
     req.log.error({ err, jobId: job.id }, "Background processing failed");
   });
-
-  const [updated] = await db
-    .update(videoJobsTable)
-    .set({ status: "downloading", progress: 5, errorMessage: null })
-    .where(eq(videoJobsTable.id, job.id))
-    .returning();
 
   res.json(updated);
 });
@@ -253,6 +256,9 @@ router.post("/jobs/:id/cancel", async (req, res): Promise<void> => {
   }
 
   abortActiveJob(id, "Stopped by user");
+  if (job.status !== "publishing") {
+    await cleanupJobVideoFile(id);
+  }
 
   const nextState =
     job.status === "publishing"

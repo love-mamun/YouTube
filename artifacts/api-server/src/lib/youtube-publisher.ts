@@ -12,24 +12,61 @@ import { unlink } from "fs/promises";
 import * as path from "path";
 import { Readable } from "stream";
 
+import { getLowRamFfmpegOptions } from "./resource-guard";
+
 const execFileAsync = promisify(execFile);
 /** Crop a horizontal video to 9:16 vertical for YouTube Shorts (1080×1920). */
-function createShortsVersionLocal(inputPath: string, outputPath: string): Promise<void> {
+function createShortsVersionLocal(
+  inputPath: string,
+  outputPath: string,
+  signal?: AbortSignal
+): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new Error("[CANCELLED] Stopped by user"));
+  }
+  const ffTuning = getLowRamFfmpegOptions();
   return new Promise((resolve, reject) => {
     const proc = spawn("ffmpeg", [
-      "-y", "-i", inputPath,
-      "-vf", "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920:flags=lanczos",
-      "-c:v", "libx264", "-b:v", "8M", "-preset", "fast", "-crf", "20",
+      "-y",
+      "-fflags", "+nobuffer",
+      "-i", inputPath,
+      "-vf", `crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920:flags=${ffTuning.scaleFlags}`,
+      "-c:v", "libx264",
+      "-maxrate", "6M",
+      "-bufsize", "6M",
+      "-preset", ffTuning.preset,
+      ...ffTuning.threadsArgs,
+      "-x264-params", ffTuning.x264Params,
+      "-crf", ffTuning.lowRam ? "21" : "20",
+      "-max_muxing_queue_size", ffTuning.maxMuxingQueueSize,
       "-c:a", "aac", "-b:a", "192k",
       outputPath,
     ], { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
-    proc.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill("SIGKILL"); } catch { /* noop */ }
+      reject(new Error("[CANCELLED] Stopped by user"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    proc.stderr?.on("data", (c: Buffer) => {
+      stderr = (stderr + c.toString()).slice(-8_192);
+    });
     proc.on("close", (code) => {
+      signal?.removeEventListener("abort", onAbort);
+      if (settled) return;
+      settled = true;
       if (code === 0) resolve();
       else reject(new Error(`Shorts crop failed (code ${code}): ${stderr.slice(-300)}`));
     });
-    proc.on("error", reject);
+    proc.on("error", (err) => {
+      signal?.removeEventListener("abort", onAbort);
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }
 
@@ -304,7 +341,7 @@ export async function publishToYouTube(
         if (vidW > 0 && vidH > 0 && vidW > vidH) {
           shortsPath = localPath.replace(/\.mp4$/i, "") + "_shorts.mp4";
           logger.info({ jobId, vidW, vidH, shortsPath }, "Horizontal video detected — creating Shorts vertical crop");
-          await createShortsVersionLocal(localPath, shortsPath);
+          await createShortsVersionLocal(localPath, shortsPath, options.signal);
           // Switch to vertical version for upload; original is preserved (it belongs to the job)
           localPath = shortsPath;
         }

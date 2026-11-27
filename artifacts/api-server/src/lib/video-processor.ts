@@ -13,8 +13,16 @@ import {
   type YtDlpMeta,
 } from "./ytdlp-downloader";
 import { generateAiContent } from "./ai-content";
-import { getVideoStoreDir } from "./ytdlp-config";
+import { getVideoStoreDir, getDiskSpaceInfo } from "./ytdlp-config";
 import { registerJobAbort, clearJobAbort } from "./job-registry";
+import { reclaimTempSpaceIfNeeded } from "./cleanup-scheduler";
+import {
+  acquireProcessingSlot,
+  estimateYtDlpSizeMB,
+  getLowRamFfmpegOptions,
+  isLowRamMode,
+  planQualityForDiskSpace,
+} from "./resource-guard";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -118,7 +126,8 @@ async function downloadVideo(
   outputPath: string,
   onProgress?: (pct: number) => void,
   codec?: string | null,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  maxFilesizeMB?: number | null
 ): Promise<void> {
   await downloadVideoWithResilience({
     url,
@@ -127,6 +136,7 @@ async function downloadVideo(
     onProgress,
     codec,
     jobTag: path.basename(outputPath, ".mp4"),
+    maxFilesizeMB,
     signal,
   });
 }
@@ -241,6 +251,7 @@ export function buildShortFormVideoFilter(options: {
   watermarkText?: string;
   hasLogo?: boolean;
   logoInputIdx?: number;
+  lowRam?: boolean;
 }): { filterComplex: string | null; videoFilter: string | null; outW: number } {
   const {
     aspectMode = "source",
@@ -249,12 +260,14 @@ export function buildShortFormVideoFilter(options: {
     applyCopyrightSuite = false,
     watermarkText = "NovaKing",
     hasLogo = false,
+    lowRam = isLowRamMode(),
   } = options;
 
   const isVertical = aspectMode === "vertical_blur" || aspectMode === "vertical_crop";
   const res = RESOLUTION_SETTINGS[quality] ?? RESOLUTION_SETTINGS["1080p"];
   const verticalW = quality === "4k" ? 2160 : 1080;
   const verticalH = quality === "4k" ? 3840 : 1920;
+  const scaleFlags = lowRam ? "bilinear" : "lanczos";
 
   const outW = isVertical ? verticalW : isPortrait ? res.h : res.w;
   const targetScale = isPortrait ? `${res.h}:${res.w}` : res.scale;
@@ -265,7 +278,7 @@ export function buildShortFormVideoFilter(options: {
       "setpts=0.98*PTS",
       "hue=h=1.8",
       "eq=brightness=0.02:contrast=1.02:saturation=1.05",
-      "unsharp=5:5:0.4:5:5:0.0"
+      lowRam ? "unsharp=3:3:0.3:3:3:0.0" : "unsharp=5:5:0.4:5:5:0.0"
     );
   }
 
@@ -277,17 +290,23 @@ export function buildShortFormVideoFilter(options: {
 
   if (aspectMode === "vertical_blur") {
     const preChain = preSteps.length > 0 ? `[0:v]${preSteps.join(",")}[pre];[pre]` : "[0:v]";
+    // In low-RAM mode, shrink the background branch to 180x320 BEFORE blurring, then scale up.
+    // Visually indistinguishable soft backdrop while cutting blur RAM usage by ~100x.
+    const bgFilter = lowRam
+      ? `[bg_src]scale=180:320:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=180:320,gblur=sigma=8,eq=brightness=-0.06,scale=${verticalW}:${verticalH}:flags=fast_bilinear[bg]`
+      : `[bg_src]scale=${verticalW}:${verticalH}:force_original_aspect_ratio=increase,crop=${verticalW}:${verticalH},gblur=sigma=28,eq=brightness=-0.06[bg]`;
+
     const chains = [
       `${preChain}split=2[fg_src][bg_src]`,
-      `[bg_src]scale=${verticalW}:${verticalH}:force_original_aspect_ratio=increase,crop=${verticalW}:${verticalH},gblur=sigma=28,eq=brightness=-0.06[bg]`,
-      `[fg_src]scale=${verticalW}:${verticalH}:force_original_aspect_ratio=decrease[fg]`,
+      bgFilter,
+      `[fg_src]scale=${verticalW}:${verticalH}:force_original_aspect_ratio=decrease:flags=${scaleFlags}[fg]`,
     ];
 
     if (useWatermarkLogo) {
       const logoW = Math.floor(outW * 0.16);
       const padding = Math.floor(outW * 0.012);
       chains.push(
-        `[1:v]scale=${logoW}:-1:flags=lanczos,split=2[wm1][wm2]`,
+        `[1:v]scale=${logoW}:-1:flags=${scaleFlags},split=2[wm1][wm2]`,
         `[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[base]`,
         `[base][wm1]overlay=main_w-overlay_w-${padding}:${padding}[v1]`,
         `[v1][wm2]overlay=${padding}:main_h-overlay_h-${padding}[vout]`
@@ -305,11 +324,11 @@ export function buildShortFormVideoFilter(options: {
   if (aspectMode === "vertical_crop") {
     singleSteps.push(
       `crop='min(iw\\,ih*9/16)':'min(ih\\,iw*16/9)':(iw-min(iw\\,ih*9/16))/2:(ih-min(ih\\,iw*16/9))/2`,
-      `scale=${verticalW}:${verticalH}:flags=lanczos`,
+      `scale=${verticalW}:${verticalH}:flags=${scaleFlags}`,
       `setsar=1`
     );
   } else {
-    singleSteps.push(`scale=${targetScale}:flags=lanczos`);
+    singleSteps.push(`scale=${targetScale}:flags=${scaleFlags}`);
     if (applyCopyrightSuite) {
       singleSteps.push("crop=iw-2:ih-2");
     } else {
@@ -321,7 +340,7 @@ export function buildShortFormVideoFilter(options: {
     const logoW = Math.floor(outW * 0.16);
     const padding = Math.floor(outW * 0.012);
     const filterComplex = [
-      `[1:v]scale=${logoW}:-1:flags=lanczos,split=2[wm1][wm2]`,
+      `[1:v]scale=${logoW}:-1:flags=${scaleFlags},split=2[wm1][wm2]`,
       `[0:v]${singleSteps.join(",")}[base]`,
       `[base][wm1]overlay=main_w-overlay_w-${padding}:${padding}[v1]`,
       `[v1][wm2]overlay=${padding}:main_h-overlay_h-${padding}[vout]`,
@@ -352,9 +371,10 @@ async function processWithFFmpegPipeline(
   const { bitrate } = res;
   const is4k = quality === "4k";
   const applyCopyrightSuite = shortOpts.applyCopyrightSuite ?? is4k;
-  const ffmpegPreset = is4k ? "veryfast" : "medium";
-  const threadArgs = is4k ? ["-threads", "2"] : [];
+  const ffTuning = getLowRamFfmpegOptions();
   const progFile = jobId ? progressFilePath(jobId) : null;
+  const diskInfo = getDiskSpaceInfo(getVideoStoreDir());
+  const useFastStart = diskInfo.availableMB === null || diskInfo.availableMB >= 900;
 
   const audioFilters: string[] = [];
   if (applyCopyrightSuite) {
@@ -374,6 +394,7 @@ async function processWithFFmpegPipeline(
     applyCopyrightSuite,
     watermarkText,
     hasLogo: logoExists,
+    lowRam: ffTuning.lowRam,
   });
 
   const clipStart =
@@ -397,6 +418,9 @@ async function processWithFFmpegPipeline(
     {
       jobId,
       quality,
+      lowRam: ffTuning.lowRam,
+      preset: ffTuning.preset,
+      useFastStart,
       aspectMode: shortOpts.aspectMode ?? "source",
       clipStart,
       clipMax,
@@ -409,6 +433,7 @@ async function processWithFFmpegPipeline(
 
   const args: string[] = [
     "-y",
+    "-fflags", "+nobuffer",
     ...(clipStart ? ["-ss", String(clipStart)] : []),
     "-i", inputPath,
     ...(useWatermarkLogoInput ? ["-i", LOGO_PATH] : []),
@@ -418,14 +443,18 @@ async function processWithFFmpegPipeline(
       : ["-vf", graph.videoFilter!]),
     ...(audioFilters.length > 0 ? ["-af", audioFilters.join(",")] : []),
     "-c:v", "libx264",
-    ...(is4k || graph.filterComplex ? ["-b:v", bitrate] : []),
-    "-preset", ffmpegPreset,
-    ...threadArgs,
-    "-crf", "19",
+    "-preset", ffTuning.preset,
+    ...ffTuning.threadsArgs,
+    "-x264-params", ffTuning.x264Params,
+    "-crf", ffTuning.lowRam ? "21" : "19",
+    ...(is4k || graph.filterComplex || ffTuning.lowRam
+      ? ["-maxrate", bitrate, "-bufsize", bitrate]
+      : []),
+    "-max_muxing_queue_size", ffTuning.maxMuxingQueueSize,
     "-c:a", "aac",
     "-b:a", "192k",
     ...(clipMax ? ["-t", String(clipMax)] : []),
-    "-movflags", "+faststart",
+    ...(useFastStart ? ["-movflags", "+faststart"] : []),
     ...(progFile ? ["-progress", progFile] : []),
     outputPath,
   ];
@@ -482,7 +511,7 @@ async function processWithFFmpegPipeline(
     }
 
     proc.stderr?.on("data", (chunk: Buffer) => {
-      stderrBuf += chunk.toString();
+      stderrBuf = (stderrBuf + chunk.toString()).slice(-16_384);
     });
 
     proc.on("close", (code) => {
@@ -515,21 +544,28 @@ async function processWithFFmpegPipeline(
  */
 export async function createShortsVersion(inputPath: string, outputPath: string): Promise<void> {
   logger.info({ inputPath, outputPath }, "Creating vertical Shorts version");
+  const ffTuning = getLowRamFfmpegOptions();
   return new Promise((resolve, reject) => {
     const args = [
       "-y", "-i", inputPath,
-      "-vf", "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920:flags=lanczos",
+      "-vf", `crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920:flags=${ffTuning.scaleFlags}`,
       "-c:v", "libx264",
-      "-b:v", "8M",
-      "-preset", "fast",
-      "-crf", "20",
+      "-maxrate", "6M",
+      "-bufsize", "6M",
+      "-preset", ffTuning.preset,
+      ...ffTuning.threadsArgs,
+      "-x264-params", ffTuning.x264Params,
+      "-crf", ffTuning.lowRam ? "21" : "20",
+      "-max_muxing_queue_size", ffTuning.maxMuxingQueueSize,
       "-c:a", "aac",
       "-b:a", "192k",
       outputPath,
     ];
     const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
-    proc.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
+    proc.stderr?.on("data", (c: Buffer) => {
+      stderr = (stderr + c.toString()).slice(-8_192);
+    });
     proc.on("close", (code) => {
       if (code === 0) { resolve(); return; }
       reject(new Error(`Shorts crop failed (code ${code}): ${stderr.slice(-300)}`));
@@ -750,13 +786,25 @@ export async function downloadVideoForJob(
 ): Promise<string> {
   const storeDir = getVideoStoreDir();
   if (!existsSync(storeDir)) mkdirSync(storeDir, { recursive: true });
+  await reclaimTempSpaceIfNeeded(700, jobId);
+  const diskPlan = planQualityForDiskSpace({
+    requestedQuality: quality,
+    needsFfmpeg: false,
+    availableMB: getDiskSpaceInfo(storeDir).availableMB,
+    estimatedSourceMB: null,
+  });
+  const effectiveQuality = diskPlan.effectiveQuality ?? quality;
+  if (diskPlan.downgradedFrom4K) {
+    logger.warn({ jobId, reason: diskPlan.reason }, "Pre-publish 4K download auto-downgraded to 1080p");
+  }
+
   const outputPath = path.join(storeDir, `job-${jobId}-raw.mp4`);
-  logger.info({ jobId, url, quality, outputPath }, "Downloading video for job (pre-publish)");
+  logger.info({ jobId, url, quality: effectiveQuality, outputPath }, "Downloading video for job (pre-publish)");
   let lastPct = 80;
   let lastWriteAt = 0;
   await downloadVideo(
     url,
-    quality,
+    effectiveQuality,
     outputPath,
     (pct) => {
       const mapped = Math.min(89, 80 + Math.floor(pct * 0.09));
@@ -768,7 +816,8 @@ export async function downloadVideoForJob(
       }
     },
     null,
-    signal
+    signal,
+    diskPlan.maxFilesizeMB
   );
   await updateJob(jobId, { videoPath: outputPath, progress: 89 });
   logger.info({ jobId, outputPath }, "Pre-publish download complete");
@@ -786,14 +835,20 @@ export async function startVideoProcessing(
   const jobAbort = registerJobAbort(jobId);
 
   const [jobRow0] = await db.select().from(videoJobsTable).where(eq(videoJobsTable.id, jobId)).limit(1);
-  const jobQuality = jobRow0?.quality ?? null;
+  let effectiveQuality = jobRow0?.quality ?? null;
   const jobCodec = jobRow0?.codec ?? null;
 
   // Any quality set = download the actual video file
-  const isDownloadJob = !!jobQuality;
+  const isDownloadJob = !!effectiveQuality;
   const needsFFmpegPipeline = jobNeedsFfmpegPipeline(jobRow0 ?? {});
 
+  let releaseSlot: (() => void) | null = null;
   try {
+    if ((isDownloadJob || needsFFmpegPipeline) && !skipToContentStage) {
+      await updateJob(jobId, { status: "pending", progress: 2, errorMessage: null });
+      releaseSlot = await acquireProcessingSlot(jobId, jobAbort.signal);
+    }
+
     // ── Stage 1: Fetch metadata ──────────────────────────────────────────────
     if (!skipToContentStage) await updateJob(jobId, { status: "downloading", progress: 5, errorMessage: null });
 
@@ -833,6 +888,25 @@ export async function startVideoProcessing(
       const storeDir = getVideoStoreDir();
       if (!existsSync(storeDir)) mkdirSync(storeDir, { recursive: true });
 
+      const reclaimRes = await reclaimTempSpaceIfNeeded(900, jobId);
+      const availableMB = reclaimRes.availableMB ?? getDiskSpaceInfo(storeDir).availableMB;
+      const estimatedSourceMB = estimateYtDlpSizeMB(meta, effectiveQuality);
+      const diskPlan = planQualityForDiskSpace({
+        requestedQuality: effectiveQuality,
+        needsFfmpeg: needsFFmpegPipeline,
+        availableMB,
+        estimatedSourceMB,
+      });
+
+      if (diskPlan.downgradedFrom4K && diskPlan.effectiveQuality) {
+        effectiveQuality = diskPlan.effectiveQuality;
+        logger.warn(
+          { jobId, availableMB, estimatedSourceMB, reason: diskPlan.reason },
+          "Auto-downgraded 4K mission to 1080p to fit free temp storage"
+        );
+        await updateJob(jobId, { quality: effectiveQuality });
+      }
+
       const rawPath = existingRawPath ?? path.join(storeDir, `job-${jobId}-raw.mp4`);
 
       if (skipDownload && existsSync(rawPath)) {
@@ -840,14 +914,17 @@ export async function startVideoProcessing(
         await updateJob(jobId, { progress: 43 });
       } else {
         await updateJob(jobId, { status: "downloading", progress: 20 });
-        logger.info({ jobId, quality: jobQuality }, "Starting full video download");
+        logger.info(
+          { jobId, quality: effectiveQuality, maxFilesizeMB: diskPlan.maxFilesizeMB, availableMB },
+          "Starting full video download"
+        );
 
         let lastDlProgress = 20;
         let lastDlWriteAt = 0;
 
         await downloadVideo(
           videoUrl,
-          jobQuality!,
+          effectiveQuality!,
           rawPath,
           (pct) => {
             const progress = Math.min(42, 20 + Math.floor(pct * 0.22));
@@ -859,7 +936,8 @@ export async function startVideoProcessing(
             }
           },
           jobCodec,
-          jobAbort.signal
+          jobAbort.signal,
+          diskPlan.maxFilesizeMB
         );
 
         logger.info({ jobId }, "Download complete");
@@ -867,9 +945,9 @@ export async function startVideoProcessing(
       }
 
       if (needsFFmpegPipeline) {
-        // ── Stage 3: FFmpeg pipeline (4K Mission only) ──────────────────────
+        // ── Stage 3: FFmpeg pipeline (4K / short-form transform) ─────────────
         await updateJob(jobId, { status: "processing", progress: 45 });
-        logger.info({ jobId, quality: jobQuality }, "Starting FFmpeg pipeline");
+        logger.info({ jobId, quality: effectiveQuality }, "Starting FFmpeg pipeline");
 
         const outPath = path.join(storeDir, `job-${jobId}-processed.mp4`);
         const watermark = await getWatermarkText();
@@ -882,7 +960,7 @@ export async function startVideoProcessing(
           rawPath,
           outPath,
           watermark,
-          jobQuality!,
+          effectiveQuality!,
           durationSecs,
           async (pct) => {
             // Map FFmpeg % (0–100) to overall progress range 45–72%
@@ -909,12 +987,12 @@ export async function startVideoProcessing(
         tryUnlink(rawPath);
         processedVideoPath = outPath;
         await updateJob(jobId, { videoPath: outPath, progress: 73 });
-        logger.info({ jobId, outPath, quality: jobQuality }, "FFmpeg pipeline complete");
+        logger.info({ jobId, outPath, quality: effectiveQuality }, "FFmpeg pipeline complete");
       } else {
         // 360p–1080p without short-form transforms: publish downloaded file directly
         processedVideoPath = rawPath;
         await updateJob(jobId, { videoPath: rawPath, progress: 73 });
-        logger.info({ jobId, rawPath, quality: jobQuality }, "FFmpeg skipped — using raw download for publish");
+        logger.info({ jobId, rawPath, quality: effectiveQuality }, "FFmpeg skipped — using raw download for publish");
       }
 
     } else {
@@ -925,6 +1003,12 @@ export async function startVideoProcessing(
       await sleep(1500);
       await updateJob(jobId, { progress: 60 });
       await sleep(1000);
+    }
+
+    // Release heavy processing queue slot before AI metadata / upload stages so next queued job can start
+    if (releaseSlot) {
+      releaseSlot();
+      releaseSlot = null;
     }
 
     // ── Stage 4: Populate content (AI Short-Form copy when Shorts/vertical targeted) ──
@@ -1004,6 +1088,7 @@ export async function startVideoProcessing(
       errorMessage: err instanceof Error ? err.message : "Processing failed",
     });
   } finally {
+    if (releaseSlot) releaseSlot();
     clearJobAbort(jobId, jobAbort);
   }
 }

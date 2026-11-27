@@ -26,6 +26,13 @@ import {
   validateScraperConfigInput,
   verifyTriggerToken,
 } from "./proxy-scraper";
+import {
+  acquireProcessingSlot,
+  estimateYtDlpSizeMB,
+  getLowRamFfmpegOptions,
+  getProcessingQueueInfo,
+  planQualityForDiskSpace,
+} from "./resource-guard";
 
 test("classifyYtDlpError distinguishes 4K_UNAVAILABLE from BOT_CHECK and COOKIES_EXPIRED", () => {
   const unavailable = classifyYtDlpError(
@@ -225,15 +232,27 @@ test("getPublicTemplateEntry exposes only unauthenticated http host:port entries
 });
 
 test("buildShortFormVideoFilter builds blurred backdrop and safe 9:16 center crop graphs", () => {
-  const blur = buildShortFormVideoFilter({
+  const blurStandard = buildShortFormVideoFilter({
     aspectMode: "vertical_blur",
     quality: "1080p",
     applyCopyrightSuite: false,
+    lowRam: false,
   });
-  assert.equal(blur.videoFilter, null);
-  assert.ok(blur.filterComplex);
-  assert.match(blur.filterComplex!, /1080:1920/);
-  assert.match(blur.filterComplex!, /gblur=sigma=28/);
+  assert.equal(blurStandard.videoFilter, null);
+  assert.ok(blurStandard.filterComplex);
+  assert.match(blurStandard.filterComplex!, /1080:1920/);
+  assert.match(blurStandard.filterComplex!, /gblur=sigma=28/);
+
+  const blurLowRam = buildShortFormVideoFilter({
+    aspectMode: "vertical_blur",
+    quality: "1080p",
+    applyCopyrightSuite: false,
+    lowRam: true,
+  });
+  assert.ok(blurLowRam.filterComplex);
+  assert.match(blurLowRam.filterComplex!, /scale=180:320/);
+  assert.match(blurLowRam.filterComplex!, /gblur=sigma=8/);
+  assert.match(blurLowRam.filterComplex!, /1080:1920/);
 
   const crop = buildShortFormVideoFilter({
     aspectMode: "vertical_crop",
@@ -374,4 +393,82 @@ test("hashTriggerToken and verifyTriggerToken validate secrets securely", () => 
   assert.equal(verifyTriggerToken("nxpx_wrong_secret_token_value_123456", hash), false);
   assert.equal(verifyTriggerToken("", hash), false);
 });
+
+test("getLowRamFfmpegOptions enforces single-thread and minimal x264 lookahead in low-RAM mode", () => {
+  const low = getLowRamFfmpegOptions(true);
+  assert.equal(low.lowRam, true);
+  assert.deepEqual(low.threadsArgs, ["-threads", "1"]);
+  assert.equal(low.preset, "superfast");
+  assert.match(low.x264Params, /rc-lookahead=8/);
+  assert.match(low.x264Params, /ref=1/);
+  assert.equal(low.scaleFlags, "bilinear");
+});
+
+test("estimateYtDlpSizeMB and planQualityForDiskSpace auto-downgrade 4K to 1080p when free disk is tight", () => {
+  const meta = {
+    duration: 180,
+    formats: [
+      { width: 3840, height: 2160, filesize: 950 * 1024 * 1024, vcodec: "vp9", acodec: "none" },
+      { width: 1920, height: 1080, filesize: 180 * 1024 * 1024, vcodec: "avc1", acodec: "none" },
+      { vcodec: "none", acodec: "mp4a.40.2", filesize: 12 * 1024 * 1024 },
+    ],
+  };
+
+  const size4k = estimateYtDlpSizeMB(meta, "4k");
+  assert.equal(size4k, 962);
+
+  // 1500 MB free with FFmpeg 2.15x peak (~2068 MB needed) exceeds usable space -> downgrade to 1080p
+  const tightPlan = planQualityForDiskSpace({
+    requestedQuality: "4k",
+    needsFfmpeg: true,
+    availableMB: 1500,
+    estimatedSourceMB: size4k,
+  });
+  assert.equal(tightPlan.downgradedFrom4K, true);
+  assert.equal(tightPlan.effectiveQuality, "1080p");
+  assert.ok(tightPlan.maxFilesizeMB && tightPlan.maxFilesizeMB < 650);
+
+  // Sub-850 MB free always auto-downgrades 4K even without format size hint
+  const lowDiskPlan = planQualityForDiskSpace({
+    requestedQuality: "4k",
+    needsFfmpeg: false,
+    availableMB: 780,
+    estimatedSourceMB: null,
+  });
+  assert.equal(lowDiskPlan.downgradedFrom4K, true);
+  assert.equal(lowDiskPlan.effectiveQuality, "1080p");
+
+  // Plenty of disk keeps 4K intact
+  const plentyPlan = planQualityForDiskSpace({
+    requestedQuality: "4k",
+    needsFfmpeg: true,
+    availableMB: 5000,
+    estimatedSourceMB: size4k,
+  });
+  assert.equal(plentyPlan.downgradedFrom4K, false);
+  assert.equal(plentyPlan.effectiveQuality, "4k");
+});
+
+test("acquireProcessingSlot enforces strict 1-job concurrency and removes aborted queued jobs cleanly", async () => {
+  const release1 = await acquireProcessingSlot(101);
+  assert.equal(getProcessingQueueInfo().activeJobId, 101);
+
+  const ac2 = new AbortController();
+  const slot2Promise = acquireProcessingSlot(102, ac2.signal);
+  const slot3Promise = acquireProcessingSlot(103);
+  assert.deepEqual(getProcessingQueueInfo().queuedJobIds, [102, 103]);
+
+  // Cancel job 102 while it is still waiting in queue
+  ac2.abort();
+  await assert.rejects(slot2Promise, /Stopped by user/);
+  assert.deepEqual(getProcessingQueueInfo().queuedJobIds, [103]);
+
+  // Releasing job 101 immediately wakes job 103
+  release1();
+  const release3 = await slot3Promise;
+  assert.equal(getProcessingQueueInfo().activeJobId, 103);
+  release3();
+  assert.equal(getProcessingQueueInfo().activeJobId, null);
+});
+
 
